@@ -1,4 +1,4 @@
-"""CoPro Python — Spatial Kernel-based Reduced Rank CCA for spatial transcriptomics."""
+"""CoPro Python — Spatial Kernel Restricted CCA for spatial transcriptomics."""
 
 from .core import CoProSingle, CoProMulti, subset_data
 from .pca import compute_pca
@@ -20,4 +20,4 @@ __all__ = [
     "compute_gene_and_cell_scores",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 copro/__init__.py
 copro/core.py
@@ -9,10 +10,11 @@ copro/pca.py
 copro/scores.py
 copro/skrcca.py
 copro/utils.py
-copro.egg-info/PKG-INFO
-copro.egg-info/SOURCES.txt
-copro.egg-info/dependency_links.txt
-copro.egg-info/requires.txt
-copro.egg-info/top_level.txt
+pycopro.egg-info/PKG-INFO
+pycopro.egg-info/SOURCES.txt
+pycopro.egg-info/dependency_links.txt
+pycopro.egg-info/requires.txt
+pycopro.egg-info/top_level.txt
 tests/test_alt_round1.py
+tests/test_multi_slide.py
 tests/test_null_round1.py
