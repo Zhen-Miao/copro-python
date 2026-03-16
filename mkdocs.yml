@@ -1,0 +1,62 @@
+site_name: CoPro Python
+site_url: https://zhen-miao.github.io/copro-python/
+site_description: Spatial Kernel Restricted CCA for spatial transcriptomics
+site_author: Zhen Miao
+repo_url: https://github.com/Zhen-Miao/copro-python
+repo_name: Zhen-Miao/copro-python
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - tables
+  - attr_list
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Tutorials:
+    - One cell type (Organoid): tutorials/one_cell_type.md
+    - Two cell types (MERFISH): tutorials/two_cell_types.md
+  - API Reference:
+    - Overview: api/overview.md
+    - Data Containers: api/core.md
+    - Pipeline Functions: api/pipeline.md
+  - R ↔ Python Reference: r_to_python.md
