@@ -1,6 +1,6 @@
 """CoPro Python — Spatial Kernel Restricted CCA for spatial transcriptomics."""
 
-from .core import CoProSingle, CoProMulti, subset_data
+from .core import CoProSingle, CoProMulti, subset_data, create_copro
 from .pca import compute_pca
 from .distance import compute_distance
 from .kernel import compute_kernel_matrix
@@ -12,6 +12,7 @@ __all__ = [
     "CoProSingle",
     "CoProMulti",
     "subset_data",
+    "create_copro",
     "compute_pca",
     "compute_distance",
     "compute_kernel_matrix",

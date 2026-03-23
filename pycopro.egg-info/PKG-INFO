@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: pycopro
 Version: 0.1.1
-Summary: Spatial Kernel-based Reduced Rank CCA for spatial transcriptomics
+Summary: Spatial Kernel Restricted CCA for spatial transcriptomics
 Author: Zhen Miao
 License: MIT
 Project-URL: Homepage, https://github.com/Zhen-Miao/copro-python
@@ -39,7 +39,7 @@ Requires-Dist: pytest-cov; extra == "dev"
 
 CoPro detects **coordinated spatial progressions** between cell types in spatial transcriptomics data. Given the spatial positions and gene expression profiles of cells, CoPro finds a low-dimensional axis along which cells of one type are spatially co-organized with cells of another type — or within a single cell type — revealing continuous tissue structure that discrete clustering misses.
 
-The method is built on **Spatial Kernel-based Reduced Rank CCA (SkrCCA)**: a power-method optimization that maximizes a spatially-weighted cross-covariance between cell type-specific PC score matrices.
+The method is built on **Spatial Kernel Restricted CCA (SkrCCA)**: a power-method optimization that maximizes a spatially-weighted cross-covariance between cell type-specific PC score matrices.
 
 > **R package:** The original R implementation is available at [github.com/Zhen-Miao/CoPro](https://github.com/Zhen-Miao/CoPro).
 

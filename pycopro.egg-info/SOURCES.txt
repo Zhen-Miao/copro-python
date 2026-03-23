@@ -16,5 +16,6 @@ pycopro.egg-info/dependency_links.txt
 pycopro.egg-info/requires.txt
 pycopro.egg-info/top_level.txt
 tests/test_alt_round1.py
+tests/test_create_copro.py
 tests/test_multi_slide.py
 tests/test_null_round1.py
