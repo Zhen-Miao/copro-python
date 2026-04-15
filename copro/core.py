@@ -39,6 +39,8 @@ class CoProSingle:
     sigma_value_choice: Optional[float] = None
     cell_scores: dict = field(default_factory=dict)
     gene_scores: dict = field(default_factory=dict)
+    gene_scores_regression: dict = field(default_factory=dict)
+    bidir_correlation: dict = field(default_factory=dict)
     n_cc: int = 2
     n_pca: int = 30
     scale_pcs: bool = True
@@ -76,6 +78,8 @@ class CoProMulti:
     sigma_value_choice: Optional[float] = None
     cell_scores: dict = field(default_factory=dict)       # "cellScores|sigma0.1|{slide}|{ct}"
     gene_scores: dict = field(default_factory=dict)       # "geneScores|sigma0.1|{ct}" (shared)
+    gene_scores_regression: dict = field(default_factory=dict)
+    bidir_correlation: dict = field(default_factory=dict)
     n_cc: int = 2
     n_pca: int = 30
     scale_pcs: bool = True

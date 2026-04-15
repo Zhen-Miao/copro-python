@@ -5,8 +5,14 @@ from .pca import compute_pca
 from .distance import compute_distance
 from .kernel import compute_kernel_matrix
 from .skrcca import run_skr_cca
-from .correlation import compute_normalized_correlation
-from .scores import compute_gene_and_cell_scores
+from .correlation import compute_normalized_correlation, compute_bidir_correlation
+from .scores import compute_gene_and_cell_scores, compute_regression_gene_scores
+from .transfer import (
+    quantile_normalize,
+    get_transfer_cell_scores,
+    get_transfer_norm_corr,
+    get_transfer_bidir_corr,
+)
 
 __all__ = [
     "CoProSingle",
@@ -18,7 +24,13 @@ __all__ = [
     "compute_kernel_matrix",
     "run_skr_cca",
     "compute_normalized_correlation",
+    "compute_bidir_correlation",
     "compute_gene_and_cell_scores",
+    "compute_regression_gene_scores",
+    "quantile_normalize",
+    "get_transfer_cell_scores",
+    "get_transfer_norm_corr",
+    "get_transfer_bidir_corr",
 ]
 
 __version__ = "0.1.1"

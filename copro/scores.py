@@ -126,3 +126,152 @@ def _compute_scores_multi(obj):
     obj.cell_scores = cell_scores
     obj.gene_scores = gene_scores
     return obj
+
+
+# ---------------------------------------------------------------------------
+# Regression-based gene scores
+# ---------------------------------------------------------------------------
+
+
+def compute_regression_gene_scores(obj, sigma=None, verbose=True):
+    """Compute regression-based gene scores for each sigma × cell type × CC.
+
+    Instead of back-projecting CCA weights through PCA loadings, this
+    regresses the raw gene expression onto the cell scores:
+
+        beta_g = cov(gene_g, cellScore) / var(cellScore)
+
+    This avoids collinearity issues and typically produces more robust
+    weights for score transfer to new datasets.
+
+    Results are stored in ``obj.gene_scores_regression`` with the same key
+    format as ``obj.gene_scores``.
+
+    Parameters
+    ----------
+    obj : CoProSingle or CoProMulti
+        Must have cell scores computed (call ``compute_gene_and_cell_scores``
+        first).
+    sigma : list of float or None
+        Sigma values to process. If None, uses all in ``obj.sigma_values``.
+    verbose : bool
+        Print progress messages.
+
+    Returns
+    -------
+    obj
+        The input object with ``gene_scores_regression`` populated.
+    """
+    from .core import CoProMulti
+    if isinstance(obj, CoProMulti):
+        return _compute_regression_gene_scores_multi(obj, sigma, verbose)
+
+    cts = obj.cell_types_of_interest
+    if not cts:
+        raise ValueError("No cell types of interest.")
+    if not obj.cell_scores:
+        raise ValueError("Cell scores missing. Run compute_gene_and_cell_scores() first.")
+
+    sigmas = sigma if sigma is not None else obj.sigma_values
+    n_cc = obj.n_cc
+
+    gene_scores_reg = {}
+
+    for sig in sigmas:
+        for ct in cts:
+            cs_key = f"cellScores|sigma{sig}|{ct}"
+            if cs_key not in obj.cell_scores:
+                continue
+            cs = obj.cell_scores[cs_key]  # (n_cells_ct, n_cc)
+
+            # Get expression matrix for this cell type
+            mask = obj.cell_types_sub == ct
+            X = obj.normalized_data_sub[mask].astype(float)  # (n_cells_ct, n_genes)
+            n_genes = X.shape[1]
+
+            gs_reg = np.zeros((n_genes, n_cc))
+
+            for cc in range(n_cc):
+                cs_cc = cs[:, cc]
+                cs_c = cs_cc - cs_cc.mean()
+                denom = np.sum(cs_c ** 2)
+
+                if denom < 1e-12:
+                    if verbose:
+                        print(f"  Warning: zero-variance cell scores for "
+                              f"sigma={sig}, {ct}, CC{cc+1}. Betas set to 0.")
+                    continue
+
+                # Center gene expression
+                X_c = X - X.mean(axis=0)
+                # beta_g = X_c^T @ cs_c / denom
+                gs_reg[:, cc] = (X_c.T @ cs_c) / denom
+
+            gs_key = f"geneScores|sigma{sig}|{ct}"
+            gene_scores_reg[gs_key] = gs_reg
+
+            if verbose:
+                print(f"Regression gene scores computed for sigma={sig}, {ct}")
+
+    obj.gene_scores_regression = gene_scores_reg
+    return obj
+
+
+def _compute_regression_gene_scores_multi(obj, sigma, verbose):
+    """Multi-slide regression gene scores. Uses per-slide cell scores."""
+    cts = obj.cell_types_of_interest
+    slides = obj.slide_list
+    sigmas = sigma if sigma is not None else obj.sigma_values
+    n_cc = obj.n_cc
+
+    gene_scores_reg = {}
+
+    for sig in sigmas:
+        for ct in cts:
+            # Gather cell scores and expression across all slides
+            all_cs = []
+            all_X = []
+            for slide in slides:
+                cs_key = f"cellScores|sigma{sig}|{slide}|{ct}"
+                if cs_key not in obj.cell_scores:
+                    continue
+                cs_slide = obj.cell_scores[cs_key]
+
+                # Get expression for this slide + cell type
+                slide_ids = obj.meta_data_sub["slideID"].values
+                mask = (obj.cell_types_sub == ct) & (slide_ids == slide)
+                X_slide = obj.normalized_data_sub[mask].astype(float)
+
+                all_cs.append(cs_slide)
+                all_X.append(X_slide)
+
+            if not all_cs:
+                continue
+
+            cs = np.vstack(all_cs)   # (n_cells_all, n_cc)
+            X = np.vstack(all_X)     # (n_cells_all, n_genes)
+            n_genes = X.shape[1]
+
+            gs_reg = np.zeros((n_genes, n_cc))
+            for cc in range(n_cc):
+                cs_cc = cs[:, cc]
+                cs_c = cs_cc - cs_cc.mean()
+                denom = np.sum(cs_c ** 2)
+
+                if denom < 1e-12:
+                    if verbose:
+                        print(f"  Warning: zero-variance cell scores for "
+                              f"sigma={sig}, {ct}, CC{cc+1}. Betas set to 0.")
+                    continue
+
+                X_c = X - X.mean(axis=0)
+                gs_reg[:, cc] = (X_c.T @ cs_c) / denom
+
+            gs_key = f"geneScores|sigma{sig}|{ct}"
+            gene_scores_reg[gs_key] = gs_reg
+
+            if verbose:
+                print(f"Regression gene scores computed for sigma={sig}, {ct}")
+
+    obj.gene_scores_regression = gene_scores_reg
+    return obj
