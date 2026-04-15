@@ -13,6 +13,12 @@ from .transfer import (
     get_transfer_norm_corr,
     get_transfer_bidir_corr,
 )
+from .permutation import (
+    run_skr_cca_permu,
+    compute_normalized_correlation_permu,
+    calculate_pvalue,
+)
+from .gene_test import test_gene_scores
 
 __all__ = [
     "CoProSingle",
@@ -31,6 +37,10 @@ __all__ = [
     "get_transfer_cell_scores",
     "get_transfer_norm_corr",
     "get_transfer_bidir_corr",
+    "run_skr_cca_permu",
+    "compute_normalized_correlation_permu",
+    "calculate_pvalue",
+    "test_gene_scores",
 ]
 
 __version__ = "0.1.1"

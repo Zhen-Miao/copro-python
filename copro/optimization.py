@@ -115,6 +115,7 @@ def optimize_bilinear(
     sigma: float,
     max_iter: int = 1000,
     tol: float = 1e-5,
+    verbose: bool = True,
 ) -> dict:
     """SkrCCA power method — first component.
 
@@ -153,7 +154,8 @@ def optimize_bilinear(
 
         diff = _check_convergence(w_dict, w_old, cell_types)
         if diff <= tol:
-            print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
+            if verbose:
+                print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
             break
     else:
         warnings.warn(f"optimize_bilinear: max_iter={max_iter} reached without convergence.")
@@ -259,6 +261,7 @@ def _bilinear_from_Y_resi(
     n_features: int,
     max_iter: int,
     tol: float,
+    verbose: bool = True,
 ) -> dict:
     """Iterative refinement using precomputed (deflated) Y matrices."""
     cell_types = list(w_new.keys())
@@ -284,7 +287,8 @@ def _bilinear_from_Y_resi(
 
         diff = _check_convergence(w_new, w_old, cell_types)
         if diff <= tol:
-            print(f"  Component convergence at iteration {iteration} (max_diff={diff:.3e})")
+            if verbose:
+                print(f"  Component convergence at iteration {iteration} (max_diff={diff:.3e})")
             break
     else:
         warnings.warn("_bilinear_from_Y_resi: max_iter reached without convergence.")
@@ -301,6 +305,7 @@ def optimize_bilinear_n(
     n_cc: int = 2,
     max_iter: int = 1000,
     tol: float = 1e-5,
+    verbose: bool = True,
 ) -> dict:
     """Compute components 2 … n_cc via deflation.
 
@@ -328,7 +333,7 @@ def optimize_bilinear_n(
         w_new = _initialize_next_component(Y, cell_types)
 
         # Refine
-        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol)
+        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol, verbose=verbose)
 
         # Append to w_dict
         for ct in cell_types:
@@ -348,6 +353,7 @@ def optimize_bilinear_multi_slides(
     slides: list,
     max_iter: int = 1000,
     tol: float = 1e-5,
+    verbose: bool = True,
 ) -> dict:
     """SkrCCA first component, multi-slide. Shared weights, sums contributions across slides.
 
@@ -407,7 +413,8 @@ def optimize_bilinear_multi_slides(
 
         diff = _check_convergence(w_dict, w_old, cell_types)
         if diff <= tol:
-            print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
+            if verbose:
+                print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
             break
     else:
         warnings.warn(f"optimize_bilinear_multi_slides: max_iter={max_iter} reached without convergence.")
@@ -427,6 +434,7 @@ def optimize_bilinear_n_multi_slides(
     n_cc: int = 2,
     max_iter: int = 1000,
     tol: float = 1e-5,
+    verbose: bool = True,
 ) -> dict:
     """Compute components 2..n_cc for multi-slide via deflation."""
     n_features = X_list_all[slides[0]][cell_types[0]].shape[1]
@@ -474,7 +482,7 @@ def optimize_bilinear_n_multi_slides(
     for qq in range(k_start - 1, n_cc - 1):
         Y = _apply_deflation(Y, w_dict, qq, cell_types)
         w_new = _initialize_next_component(Y, cell_types)
-        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol)
+        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol, verbose=verbose)
         for ct in cell_types:
             w_dict[ct] = np.hstack([w_dict[ct], w_new[ct]])
 

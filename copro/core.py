@@ -45,6 +45,14 @@ class CoProSingle:
     n_pca: int = 30
     scale_pcs: bool = True
 
+    # Permutation testing
+    cell_permu: dict = field(default_factory=dict)
+    skr_cca_permu_out: dict = field(default_factory=dict)
+    normalized_correlation_permu: dict = field(default_factory=dict)
+
+    # Gene score testing (GLM / LMM)
+    gene_score_test: dict = field(default_factory=dict)
+
 
 @dataclass
 class CoProMulti:
@@ -83,6 +91,14 @@ class CoProMulti:
     n_cc: int = 2
     n_pca: int = 30
     scale_pcs: bool = True
+
+    # Permutation testing
+    cell_permu: dict = field(default_factory=dict)
+    skr_cca_permu_out: dict = field(default_factory=dict)
+    normalized_correlation_permu: dict = field(default_factory=dict)
+
+    # Gene score testing (GLM / LMM)
+    gene_score_test: dict = field(default_factory=dict)
 
 
 def subset_data(obj, cell_types_of_interest: list, min_cells: int = 10):
