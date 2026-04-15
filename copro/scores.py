@@ -15,7 +15,7 @@ def compute_gene_and_cell_scores(obj):
 
     Single-slide:
       Cell scores  : X_scaled @ w   → (n_cells_ct, n_cc)
-      Gene scores  : (w * sdev)^T @ rotation^T   → (n_genes, n_cc)
+      Gene scores  : (w * (1/sdev))^T @ rotation^T   → (n_genes, n_cc)
       Keys: 'cellScores|sigma{s}|{ct}' and 'geneScores|sigma{s}|{ct}'.
 
     Multi-slide:
@@ -61,10 +61,13 @@ def compute_gene_and_cell_scores(obj):
             cell_key = f"cellScores|sigma{sigma}|{ct}"
             cell_scores[cell_key] = cs
 
-            # Gene scores — matches R: matrix(w * sdev, nrow=1) %*% t(rotation)
-            # = (w * sdev)^T @ rotation^T = rotation @ (w * sdev)  [per column]
+            # Gene scores — matches R: matrix(w * (1/sdev), nrow=1) %*% t(rotation)
+            # gene_score = R %*% diag(1/sdev) %*% w  (regression coefficient)
+            # This inverts the sdev scaling applied during PCA whitening.
             if scale_pcs:
-                sdev_use = sdev
+                sdev_safe = sdev.copy()
+                sdev_safe[sdev_safe < 1e-10] = 1.0
+                sdev_use = 1.0 / sdev_safe
             else:
                 sdev_use = np.ones_like(sdev)
 
@@ -101,7 +104,12 @@ def _compute_scores_multi(obj):
             pca = obj.pca_global[ct]
             rotation = pca["rotation"]  # (n_genes, n_pca)
             sdev = pca["sdev"]
-            sdev_use = sdev if scale_pcs else np.ones_like(sdev)
+            if scale_pcs:
+                sdev_safe = sdev.copy()
+                sdev_safe[sdev_safe < 1e-10] = 1.0
+                sdev_use = 1.0 / sdev_safe
+            else:
+                sdev_use = np.ones_like(sdev)
 
             # Gene scores: shared (no slide in key)
             gs = rotation @ (W * sdev_use[:, np.newaxis])
