@@ -170,6 +170,118 @@ def compute_kernel_matrix(
     return obj
 
 
+def compute_self_kernel(
+    obj,
+    sigma_values: list | None = None,
+    lower_limit: float = 1e-7,
+    upper_quantile: float = 0.85,
+    min_ave_cell_neighbor: float = 2.0,
+    row_normalize_kernel: bool = False,
+    col_normalize_kernel: bool = False,
+    verbose: bool = True,
+):
+    """Compute within-cell-type kernel matrices when multiple cell types are present.
+
+    Adds self-kernel entries (``kernel|sigma{s}|A|A``, …) to
+    ``obj.kernel_matrices`` without overwriting existing cross-type kernels.
+    Requires self-distance matrices — call ``compute_self_distance()`` first.
+
+    Parameters
+    ----------
+    sigma_values : list or None
+        Sigma values to use. Defaults to ``obj.sigma_values``.
+    """
+    from .core import CoProMulti
+    if isinstance(obj, CoProMulti):
+        return _compute_self_kernel_multi(
+            obj, sigma_values, lower_limit, upper_quantile,
+            min_ave_cell_neighbor, row_normalize_kernel, col_normalize_kernel, verbose,
+        )
+
+    cts = obj.cell_types_of_interest
+    if len(cts) == 1:
+        warnings.warn("Only one cell type — use compute_kernel_matrix() instead.")
+        return obj
+
+    if sigma_values is None:
+        sigma_values = obj.sigma_values
+    sigma_values = list(sigma_values)
+
+    for ct in cts:
+        fn = _dist_flat_name(ct, ct)
+        if fn not in obj.distances:
+            raise ValueError(
+                f"Self-distance for {ct} not found. Run compute_self_distance() first."
+            )
+
+    if verbose:
+        print(f"Computing self-kernel matrices for {len(cts)} cell types")
+
+    for sigma in sigma_values:
+        for ct in cts:
+            dist_mat = obj.distances[_dist_flat_name(ct, ct)]
+            dist_use = dist_mat.copy()
+            dist_use[~np.isfinite(dist_use)] = np.nanmax(dist_use[np.isfinite(dist_use)])
+
+            K = _kernel_from_distance(dist_use, sigma, lower_limit)
+
+            if _should_remove_sigma(K, lower_limit, sigma, ct, ct, min_ave_cell_neighbor, sigma_values):
+                continue
+
+            K = _process_kernel(K, lower_limit, upper_quantile, row_normalize_kernel, col_normalize_kernel)
+            obj.kernel_matrices[_kernel_flat_name(sigma, ct, ct)] = K
+
+            if verbose:
+                print(f"  sigma={sigma}, {ct}: {K.shape[0]}×{K.shape[1]}")
+
+    return obj
+
+
+def _compute_self_kernel_multi(
+    obj, sigma_values, lower_limit, upper_quantile,
+    min_ave_cell_neighbor, row_normalize_kernel, col_normalize_kernel, verbose,
+):
+    """Multi-slide self-kernel. Adds 'kernel|sigma{s}|{slide}|ct|ct' entries."""
+    cts = obj.cell_types_of_interest
+    slides = obj.slide_list
+
+    if len(cts) == 1:
+        warnings.warn("Only one cell type — use compute_kernel_matrix() instead.")
+        return obj
+
+    if sigma_values is None:
+        sigma_values = obj.sigma_values
+    sigma_values = list(sigma_values)
+
+    if verbose:
+        print(f"Computing self-kernels for {len(cts)} cell types across {len(slides)} slides")
+
+    for sigma in sigma_values:
+        for slide in slides:
+            for ct in cts:
+                flat_dist = f"dist|{slide}|{ct}|{ct}"
+                if flat_dist not in obj.distances:
+                    continue
+
+                dist_mat = obj.distances[flat_dist]
+                dist_use = dist_mat.copy()
+                dist_use[~np.isfinite(dist_use)] = np.nanmax(dist_use[np.isfinite(dist_use)])
+
+                K = _kernel_from_distance(dist_use, sigma, lower_limit)
+
+                if _should_remove_sigma(K, lower_limit, sigma, ct, ct, min_ave_cell_neighbor, sigma_values):
+                    continue
+
+                K = _process_kernel(K, lower_limit, upper_quantile, row_normalize_kernel, col_normalize_kernel)
+                flat_kernel = f"kernel|sigma{sigma}|{slide}|{ct}|{ct}"
+                obj.kernel_matrices[flat_kernel] = K
+
+                if verbose:
+                    print(f"  sigma={sigma}, {slide}, {ct}: {K.shape[0]}×{K.shape[1]}")
+
+    return obj
+
+
 def _compute_kernel_matrix_multi(
     obj,
     sigma_values,

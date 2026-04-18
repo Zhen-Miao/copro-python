@@ -118,6 +118,88 @@ def run_skr_cca(
     return obj
 
 
+def run_skr_cca_supervised(
+    obj,
+    supervised_weights: dict,
+    scale_pcs: bool = True,
+    n_cc: int = 4,
+    tol: float = 1e-5,
+    max_iter: int = 500,
+):
+    """Run SkrCCA with user-supplied first-component weights (supervised/guided mode).
+
+    The first canonical component is fixed to the supplied weight vectors,
+    and additional components (2 … *n_cc*) are optimised via the standard
+    bilinear procedure while being constrained to be orthogonal to the
+    supervised component.
+
+    Parameters
+    ----------
+    obj : CoProSingle
+        Must already have PCA results and kernel matrices.
+    supervised_weights : dict
+        ``{cell_type: w1_vector}`` — one 1-D array per cell type whose
+        length matches the number of PCs.  Each vector will be
+        L2-normalised internally.
+    scale_pcs : bool
+        Whether to scale PC scores by their standard deviation (matches
+        R ``scale(pca$x, center=FALSE, scale=sdev)``).
+    n_cc : int
+        Total number of CCs (including the supervised first CC).
+    tol : float
+        Convergence tolerance for the optimiser.
+    max_iter : int
+        Maximum iterations.
+
+    Returns
+    -------
+    obj
+        Updated in-place with ``skr_cca_out``, ``n_cc``, ``scale_pcs``.
+    """
+    cts = obj.cell_types_of_interest
+    if not cts:
+        raise ValueError("No cell types of interest. Run subset_data() first.")
+
+    # Validate supervised_weights
+    for ct in cts:
+        if ct not in supervised_weights:
+            raise ValueError(f"supervised_weights missing key '{ct}'.")
+
+    X_dict = _prepare_pc_matrices(obj, scale_pcs, cts)
+    obj.scale_pcs = scale_pcs
+    obj.n_cc = n_cc
+
+    cca_out = {}
+    for sigma in obj.sigma_values:
+        sigma_name = f"sigma_{sigma}"
+        print(f"Running supervised SkrCCA for sigma = {sigma}")
+
+        # First component: use supervised weights (normalised)
+        w_dict = {}
+        for ct in cts:
+            w = np.asarray(supervised_weights[ct], dtype=float).ravel()
+            w = w / np.linalg.norm(w)
+            w_dict[ct] = w.reshape(-1, 1)
+
+        # Additional components via standard optimization
+        if n_cc > 1:
+            w_dict = optimize_bilinear_n(
+                X_dict=X_dict,
+                flat_kernels=obj.kernel_matrices,
+                sigma=sigma,
+                w_dict=w_dict,
+                cell_types=cts,
+                n_cc=n_cc,
+                max_iter=max_iter,
+                tol=tol,
+            )
+
+        cca_out[sigma_name] = w_dict
+
+    obj.skr_cca_out = cca_out
+    return obj
+
+
 def _run_skr_cca_multi(obj, scale_pcs, n_cc, tol, max_iter):
     """Multi-slide SkrCCA optimization. Shared weight vectors across slides."""
     from .optimization import optimize_bilinear_multi_slides, optimize_bilinear_n_multi_slides

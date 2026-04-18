@@ -136,6 +136,115 @@ def compute_distance(
     return obj
 
 
+def compute_self_distance(
+    obj,
+    dist_type: str = "Euclidean2D",
+    normalize: bool = True,
+    truncate: bool = True,
+    verbose: bool = True,
+):
+    """Compute within-cell-type distance matrices when multiple cell types are present.
+
+    Adds self-distance entries (``dist|A|A``, ``dist|B|B``, …) to
+    ``obj.distances`` without overwriting existing cross-type distances.
+    This is only needed when there are 2+ cell types — with a single
+    cell type, ``compute_distance`` already computes the self-distance.
+
+    Dispatches to multi-slide version for CoProMulti objects.
+    """
+    from .core import CoProMulti
+    if isinstance(obj, CoProMulti):
+        return _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose)
+
+    cts = obj.cell_types_of_interest
+    if not cts:
+        raise ValueError("No cell types of interest. Run subset_data() first.")
+    if len(cts) == 1:
+        warnings.warn("Only one cell type — use compute_distance() instead.")
+        return obj
+
+    if dist_type != "Euclidean2D":
+        raise NotImplementedError(f"dist_type '{dist_type}' not implemented.")
+
+    loc = obj.location_data_sub
+    all_percentiles = []
+    raw_mats = {}
+
+    for ct in cts:
+        mask = obj.cell_types_sub == ct
+        coords = loc.loc[mask, ["x", "y"]].values.astype(float)
+        if len(coords) <= 5:
+            if verbose:
+                print(f"Skipping self-distance for {ct}: only {len(coords)} cells.")
+            continue
+        dist_mat = cdist(coords, coords)
+        dist_mat, pct = _process_distance_matrix(
+            dist_mat, truncate, percentile_choice=1e-4, set_diag_inf=True,
+        )
+        raw_mats[_dist_flat_name(ct, ct)] = dist_mat
+        all_percentiles.append(pct)
+        if verbose:
+            print(f"Self-distance for {ct}: {len(coords)} cells")
+
+    if normalize and all_percentiles:
+        min_pct = min(all_percentiles)
+        scaling = 0.01 / min_pct
+        if verbose:
+            print(f"Self-distance scaling factor: {scaling:.4f}")
+        for k, v in raw_mats.items():
+            obj.distances[k] = v * scaling
+    else:
+        for k, v in raw_mats.items():
+            obj.distances[k] = v
+
+    return obj
+
+
+def _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose):
+    """Multi-slide self-distance. Adds 'dist|{slide}|ct|ct' entries."""
+    cts = obj.cell_types_of_interest
+    slides = obj.slide_list
+    slide_ids = obj.meta_data_sub["slideID"].values
+    loc = obj.location_data_sub
+
+    if len(cts) == 1:
+        warnings.warn("Only one cell type — use compute_distance() instead.")
+        return obj
+
+    all_percentiles = []
+    raw_mats = {}
+
+    for ct in cts:
+        for slide in slides:
+            mask = (obj.cell_types_sub == ct) & (slide_ids == slide)
+            n = int(mask.sum())
+            if n <= 5:
+                if verbose:
+                    print(f"Skipping self-distance for {ct} in {slide}: {n} cells.")
+                continue
+            coords = loc.loc[mask, ["x", "y"]].values.astype(float)
+            dist_mat = cdist(coords, coords)
+            dist_mat, pct = _process_distance_matrix(
+                dist_mat, truncate, percentile_choice=1e-4, set_diag_inf=True,
+            )
+            flat_name = f"dist|{slide}|{ct}|{ct}"
+            raw_mats[flat_name] = dist_mat
+            all_percentiles.append(pct)
+
+    if normalize and all_percentiles:
+        min_pct = min(all_percentiles)
+        scaling = 0.01 / min_pct
+        if verbose:
+            print(f"Global self-distance scaling factor: {scaling:.4f}")
+        for k, v in raw_mats.items():
+            obj.distances[k] = v * scaling
+    else:
+        for k, v in raw_mats.items():
+            obj.distances[k] = v
+
+    return obj
+
+
 def _compute_distance_multi(obj, dist_type="Euclidean2D", normalize=True, truncate=True):
     """Multi-slide distance computation. Keys: 'dist|{slide}|ct_i|ct_j'."""
     cts = obj.cell_types_of_interest

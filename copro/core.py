@@ -41,6 +41,7 @@ class CoProSingle:
     gene_scores: dict = field(default_factory=dict)
     gene_scores_regression: dict = field(default_factory=dict)
     bidir_correlation: dict = field(default_factory=dict)
+    self_bidir_correlation: dict = field(default_factory=dict)
     n_cc: int = 2
     n_pca: int = 30
     scale_pcs: bool = True
@@ -88,6 +89,7 @@ class CoProMulti:
     gene_scores: dict = field(default_factory=dict)       # "geneScores|sigma0.1|{ct}" (shared)
     gene_scores_regression: dict = field(default_factory=dict)
     bidir_correlation: dict = field(default_factory=dict)
+    self_bidir_correlation: dict = field(default_factory=dict)
     n_cc: int = 2
     n_pca: int = 30
     scale_pcs: bool = True

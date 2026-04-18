@@ -438,6 +438,195 @@ def _compute_bidir_correlation_multi(
     return obj
 
 
+def compute_self_bidir_correlation(
+    obj,
+    normalize_K: str = "row_or_col",
+    filter_kernel: bool = True,
+    K_row_sum_cutoff: float = 5e-3,
+    K_col_sum_cutoff: float = 5e-3,
+    verbose: bool = True,
+):
+    """Compute within-cell-type bidirectional correlation using self-kernels.
+
+    For each cell type *ct*, computes:
+    ``mean( cor(K_self^T @ A_w, A_w),  cor(A_w, K_self @ A_w) )``
+
+    where ``A_w`` is the cell-score vector for that cell type and ``K_self``
+    is the within-type kernel matrix.
+
+    Requires self-kernel matrices — call ``compute_self_kernel()`` first.
+    Only meaningful when 2+ cell types are present (with 1 cell type,
+    ``compute_bidir_correlation`` already computes this).
+
+    Results are stored in ``obj.self_bidir_correlation``.
+    """
+    from .core import CoProMulti
+    if isinstance(obj, CoProMulti):
+        return _compute_self_bidir_correlation_multi(
+            obj, normalize_K, filter_kernel,
+            K_row_sum_cutoff, K_col_sum_cutoff, verbose,
+        )
+
+    cts = obj.cell_types_of_interest
+    if not obj.skr_cca_out:
+        raise ValueError("CCA results missing. Run run_skr_cca() first.")
+    if len(cts) == 1:
+        import warnings
+        warnings.warn("Only one cell type — use compute_bidir_correlation() instead.")
+        return obj
+
+    scale_pcs = getattr(obj, "scale_pcs", True)
+    n_cc = obj.n_cc
+    X_dict = _prepare_pc_matrices(obj, scale_pcs, cts)
+
+    self_bidir = {}
+    for sigma in obj.sigma_values:
+        sigma_name = f"sigma_{sigma}"
+        w_sigma = obj.skr_cca_out.get(sigma_name)
+        if w_sigma is None:
+            continue
+
+        rows = []
+        for ct in cts:
+            # Look up self-kernel
+            K = _get_self_kernel(obj.kernel_matrices, sigma, ct)
+            if K is None:
+                if verbose:
+                    print(f"  No self-kernel for {ct} sigma={sigma}, skipping.")
+                continue
+
+            W = w_sigma[ct]
+            A_all = X_dict[ct] @ W  # (n_cells, n_cc)
+
+            # Filter (square kernel — same cells on both dims)
+            K_use = K.copy()
+            A_use = A_all.copy()
+            if filter_kernel:
+                keep = (K_use.sum(axis=1) > K_row_sum_cutoff) & \
+                       (K_use.sum(axis=0) > K_col_sum_cutoff)
+                K_use = K_use[np.ix_(keep, keep)]
+                A_use = A_use[keep]
+
+            corrs = _compute_self_bidir_corrs_all_cc(A_use, K_use, normalize_K)
+
+            for cc in range(n_cc):
+                rows.append({
+                    "sigma": sigma,
+                    "cell_type": ct,
+                    "CC_index": cc + 1,
+                    "self_bidir_correlation": corrs[cc],
+                })
+
+        self_bidir[sigma_name] = pd.DataFrame(rows)
+
+    obj.self_bidir_correlation = self_bidir
+    return obj
+
+
+def _compute_self_bidir_correlation_multi(
+    obj, normalize_K, filter_kernel, K_row_sum_cutoff, K_col_sum_cutoff, verbose,
+):
+    """Multi-slide self bidirectional correlation."""
+    cts = obj.cell_types_of_interest
+    slides = obj.slide_list
+    n_cc = obj.n_cc
+
+    if len(cts) == 1:
+        import warnings
+        warnings.warn("Only one cell type — use compute_bidir_correlation() instead.")
+        return obj
+
+    X_list_all = {
+        slide: {ct: obj.pca_results[slide][ct].astype(float)
+                for ct in cts if ct in obj.pca_results.get(slide, {})}
+        for slide in slides
+    }
+
+    self_bidir = {}
+    for sigma in obj.sigma_values:
+        sigma_name = f"sigma_{sigma}"
+        w_sigma = obj.skr_cca_out.get(sigma_name)
+        if w_sigma is None:
+            continue
+
+        rows = []
+        for ct in cts:
+            W = w_sigma[ct]
+            for slide in slides:
+                A_raw = X_list_all[slide].get(ct)
+                if A_raw is None:
+                    continue
+                flat_kernel = f"kernel|sigma{sigma}|{slide}|{ct}|{ct}"
+                K = obj.kernel_matrices.get(flat_kernel)
+                if K is None:
+                    continue
+
+                A_all = A_raw @ W
+
+                K_use = K.copy()
+                A_use = A_all.copy()
+                if filter_kernel:
+                    keep = (K_use.sum(axis=1) > K_row_sum_cutoff) & \
+                           (K_use.sum(axis=0) > K_col_sum_cutoff)
+                    K_use = K_use[np.ix_(keep, keep)]
+                    A_use = A_use[keep]
+
+                corrs = _compute_self_bidir_corrs_all_cc(A_use, K_use, normalize_K)
+
+                for cc in range(n_cc):
+                    rows.append({
+                        "sigma": sigma,
+                        "slideID": slide,
+                        "cell_type": ct,
+                        "CC_index": cc + 1,
+                        "self_bidir_correlation": corrs[cc],
+                    })
+
+        self_bidir[sigma_name] = pd.DataFrame(rows)
+
+    obj.self_bidir_correlation = self_bidir
+    return obj
+
+
+def _get_self_kernel(kernel_matrices: dict, sigma: float, ct: str):
+    """Look up self-kernel matrix, return None if missing."""
+    key = f"kernel|sigma{sigma}|{ct}|{ct}"
+    return kernel_matrices.get(key)
+
+
+def _compute_self_bidir_corrs_all_cc(
+    A_all: np.ndarray,
+    K: np.ndarray,
+    normalize_K: str,
+) -> np.ndarray:
+    """Bidir correlation for self-type: mean(cor(K^T @ A, A), cor(A, K @ A))."""
+    n_cc = A_all.shape[1]
+
+    if normalize_K == "row_or_col":
+        rs = K.sum(axis=1, keepdims=True)
+        rs[rs < 1e-12] = 1.0
+        K_row = K / rs
+        cs = K.sum(axis=0, keepdims=True)
+        cs[cs < 1e-12] = 1.0
+        K_col = K / cs
+        KtA = K_row.T @ A_all
+        KA = K_col @ A_all
+    elif normalize_K == "sinkhorn_knopp":
+        K_norm = _sinkhorn_knopp(K)
+        KtA = K_norm.T @ A_all
+        KA = K_norm @ A_all
+    else:
+        KtA = K.T @ A_all
+        KA = K @ A_all
+
+    corrs = np.zeros(n_cc)
+    for cc in range(n_cc):
+        cor1 = _safe_pearsonr(KtA[:, cc], A_all[:, cc])
+        cor2 = _safe_pearsonr(A_all[:, cc], KA[:, cc])
+        corrs[cc] = (cor1 + cor2) / 2.0
+    return corrs
+
+
 def _safe_pearsonr(x: np.ndarray, y: np.ndarray) -> float:
     """Pearson correlation, 0.0 if either vector has zero variance."""
     x = x - x.mean()
