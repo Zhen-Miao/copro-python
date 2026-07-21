@@ -252,29 +252,52 @@ def _apply_deflation(
     sdev2_dict: dict | None = None,
     method: str = "rank1",
 ) -> dict:
-    """Deflate PC-space operators with rank-one or two-sided projection."""
+    """Deflate PC-space operators with rank-one or two-sided projection.
+
+    ``method="projection"`` supports both the unweighted metric (``sdev2_dict``
+    is ``None``; whitened / ``scale_pcs=True`` PCs) and the weighted CCA metric
+    (``sdev2_dict`` set; raw / ``scale_pcs=False`` PCs).  The weighted form is
+    the exact image of the whitened orthogonal projection under the change of
+    variables ``X~ = X diag(sdev)**-1`` and ``w~ = diag(sdev) w``, so the
+    deflated operator is identical in both parametrizations.  This is what keeps
+    every canonical axis of a >2-type problem the same whether or not PCs are
+    scaled -- ``scale_pcs`` remains a pure reparametrization on all axes.
+    """
     if method not in {"rank1", "projection"}:
         raise ValueError("method must be 'rank1' or 'projection'.")
-    if method == "projection" and sdev2_dict is not None:
-        raise ValueError("Projection deflation is not defined with weighted metrics.")
     is_within = len(cell_types) == 1
 
-    def project(Y1, w1, w2):
-        u = w1 / np.linalg.norm(w1)
-        v = w2 / np.linalg.norm(w2)
-        return (
-            Y1
-            - u @ (u.T @ Y1)
-            - (Y1 @ v) @ v.T
-            + float((u.T @ Y1 @ v).item()) * (u @ v.T)
-        )
+    def project(Y1, w1, w2, d1=None, d2=None):
+        # Two-sided projection deflation (I - p1 q1^T) Y (I - q2 p2^T) where q is
+        # the weight normalized under the (possibly weighted) metric and p = D q.
+        # With no metric (d=None) p == q and this reduces to the orthogonal
+        # projection (I - u u^T) Y (I - v v^T).  With D = diag(sdev**2) it is the
+        # oblique projection (I - D1 q1 q1^T) Y (I - q2 q2^T D2), i.e. the exact
+        # image of the whitened orthogonal projection under w~ = diag(sdev) w.
+        if d1 is None:
+            q1 = w1 / np.linalg.norm(w1)
+            p1 = q1
+        else:
+            d1 = np.asarray(d1, dtype=float).reshape(-1, 1)
+            q1 = w1 / float(np.sqrt((w1 * d1 * w1).sum()))
+            p1 = d1 * q1
+        if d2 is None:
+            q2 = w2 / np.linalg.norm(w2)
+            p2 = q2
+        else:
+            d2 = np.asarray(d2, dtype=float).reshape(-1, 1)
+            q2 = w2 / float(np.sqrt((w2 * d2 * w2).sum()))
+            p2 = d2 * q2
+        lam = float((q1.T @ Y1 @ q2).item())
+        return Y1 - p1 @ (q1.T @ Y1) - (Y1 @ q2) @ p2.T + lam * (p1 @ p2.T)
 
     if is_within:
         ct = cell_types[0]
         Y1 = Y[ct][ct]
         w1 = w_dict[ct][:, qq : qq + 1]
+        d_ct = None if sdev2_dict is None else sdev2_dict[ct]
         if method == "projection":
-            Y[ct][ct] = project(Y1, w1, w1)
+            Y[ct][ct] = project(Y1, w1, w1, d_ct, d_ct)
         else:
             lam = float((w1.T @ Y1 @ w1).flat[0])
             if sdev2_dict is None:
@@ -288,7 +311,9 @@ def _apply_deflation(
             w2 = w_dict[ct_j][:, qq : qq + 1]
             Y1 = Y[ct_i][ct_j]
             if method == "projection":
-                Y[ct_i][ct_j] = project(Y1, w1, w2)
+                d_i = None if sdev2_dict is None else sdev2_dict[ct_i]
+                d_j = None if sdev2_dict is None else sdev2_dict[ct_j]
+                Y[ct_i][ct_j] = project(Y1, w1, w2, d_i, d_j)
             else:
                 lam = float((w1.T @ Y1 @ w2).flat[0])
                 if sdev2_dict is None:
@@ -357,8 +382,16 @@ def _bilinear_from_Y_resi(
 
         if is_within:
             ct = cell_types[0]
+            # Maximizing w^T Y w depends only on the symmetric part of Y, so
+            # iterate on (Y + Y^T)/2.  For a symmetric self-kernel this is a
+            # no-op; for an asymmetric (row/col-normalized) self-kernel it makes
+            # this single-slide refinement agree with the symmetric operator
+            # already used by _initialize_next_component and the multi-slide
+            # direct solve.
+            Y_ct = Y[ct][ct]
+            Y_sym = (Y_ct + Y_ct.T) * 0.5
             update = _normalize_gradient_weighted(
-                Y[ct][ct] @ w_new[ct],
+                Y_sym @ w_new[ct],
                 None if sdev2_dict is None else sdev2_dict[ct],
             )
             if step_size < 1:
@@ -436,12 +469,13 @@ def optimize_bilinear_n(
             return exact
 
     for qq in range(k_start - 1, n_cc - 1):
-        # Deflate using component qq
-        method = (
-            "projection"
-            if len(cell_types) > 2 and sdev2_dict is None
-            else "rank1"
-        )
+        # Deflate using component qq.  For >2 cell types the stationary vectors
+        # are not pairwise singular vectors, so full projection (not rank-1) is
+        # required to keep later axes orthogonal within every cell type.  We use
+        # projection for both metrics: _apply_deflation implements the weighted
+        # projection so scale_pcs=True/False yield the same axes (see DEFECT 1).
+        # Two-type / within-type deflation keeps the established rank-1 rule.
+        method = "projection" if len(cell_types) > 2 else "rank1"
         Y = _apply_deflation(
             Y, w_dict, qq, cell_types,
             sdev2_dict=sdev2_dict, method=method,
@@ -613,11 +647,11 @@ def optimize_bilinear_n_multi_slides(
             return exact
 
     for qq in range(k_start - 1, n_cc - 1):
-        method = (
-            "projection"
-            if len(cell_types) > 2 and sdev2_dict is None
-            else "rank1"
-        )
+        # >2 cell types require full projection deflation for later axes; the
+        # weighted projection in _apply_deflation makes scale_pcs=True/False
+        # produce the same axes (see DEFECT 1).  Two-type / within-type deflation
+        # keeps the established rank-1 rule.
+        method = "projection" if len(cell_types) > 2 else "rank1"
         Y = _apply_deflation(
             Y, w_dict, qq, cell_types,
             sdev2_dict=sdev2_dict, method=method,

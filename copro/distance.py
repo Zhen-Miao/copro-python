@@ -15,6 +15,29 @@ def _dist_flat_name(ct_i: str, ct_j: str) -> str:
     return f"dist|{ct_i}|{ct_j}"
 
 
+def _store_self_distance_scale(obj, scaling: float) -> None:
+    """Record the within-type (self) distance normalization factor.
+
+    R parity: ``computeSelfDistance()`` (compute_self_distance_kernel.R) never
+    writes ``@distanceScaleFactor`` — it applies the self scaling to the
+    within-type matrices and leaves the CROSS-type factor set by
+    ``computeDistance()`` untouched. That cross factor is what the sigma-aware
+    permutation binning (``.recoverDistanceScaleFactor`` / ``.sigmaAwareBins``)
+    relies on, because the cross-type permutation correlation is defined in
+    CROSS-normalized units.
+
+    We therefore store the self factor on a dedicated
+    ``self_distance_scale_factor`` attribute and only populate
+    ``distance_scale_factor`` when no cross-type factor has been recorded yet
+    (i.e. ``compute_distance`` was never called). This preserves the cross
+    value whenever it exists while keeping the standalone self path consistent
+    with the sparse self-kernel path in ``kernel.py``.
+    """
+    obj.self_distance_scale_factor = scaling
+    if getattr(obj, "distance_scale_factor", None) is None:
+        obj.distance_scale_factor = scaling
+
+
 def _process_distance_matrix(
     dist_mat: np.ndarray,
     truncate: bool,
@@ -221,13 +244,13 @@ def compute_self_distance(
     if normalize and all_percentiles:
         min_pct = min(all_percentiles)
         scaling = normalize_target / min_pct
-        obj.distance_scale_factor = scaling
+        _store_self_distance_scale(obj, scaling)
         if verbose:
             print(f"Self-distance scaling factor: {scaling:.4f}")
         for k, v in raw_mats.items():
             obj.distances[k] = v * scaling
     else:
-        obj.distance_scale_factor = 1.0
+        _store_self_distance_scale(obj, 1.0)
         for k, v in raw_mats.items():
             obj.distances[k] = v
 
@@ -274,13 +297,13 @@ def _compute_self_distance_multi(
     if normalize and all_percentiles:
         min_pct = min(all_percentiles)
         scaling = normalize_target / min_pct
-        obj.distance_scale_factor = scaling
+        _store_self_distance_scale(obj, scaling)
         if verbose:
             print(f"Global self-distance scaling factor: {scaling:.4f}")
         for k, v in raw_mats.items():
             obj.distances[k] = v * scaling
     else:
-        obj.distance_scale_factor = 1.0
+        _store_self_distance_scale(obj, 1.0)
         for k, v in raw_mats.items():
             obj.distances[k] = v
 

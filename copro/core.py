@@ -35,6 +35,7 @@ class CoProSingle:
     pca_global: dict = field(default_factory=dict)        # ct → dict with components/scores/sdev
     distances: dict = field(default_factory=dict)         # flat keys: "dist|A|B"
     distance_scale_factor: Optional[float] = None
+    self_distance_scale_factor: Optional[float] = None    # WITHIN-type factor (compute_self_distance)
     kernel_matrices: dict = field(default_factory=dict)   # flat keys: "kernel|sigma0.1|A|B"
     sigma_values: list = field(default_factory=list)
     skr_cca_out: dict = field(default_factory=dict)       # "sigma_0.1" → {ct: w_matrix}
@@ -91,6 +92,7 @@ class CoProMulti:
     # Computed results
     distances: dict = field(default_factory=dict)         # flat keys: "dist|{slide}|A|B"
     distance_scale_factor: Optional[float] = None
+    self_distance_scale_factor: Optional[float] = None    # WITHIN-type factor (compute_self_distance)
     kernel_matrices: dict = field(default_factory=dict)   # flat keys: "kernel|sigma0.1|{slide}|A|B"
     sigma_values: list = field(default_factory=list)
     skr_cca_out: dict = field(default_factory=dict)       # "sigma_0.1" → {ct: w_matrix} (shared)

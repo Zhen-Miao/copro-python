@@ -231,7 +231,21 @@ def _dense_kernel_core(
     col_normalize_kernel: bool,
     normalize_kernel: bool,
 ):
-    """Classic distance-to-kernel path for single- and multi-slide objects."""
+    """Classic distance-to-kernel path for single- and multi-slide objects.
+
+    This branch **consumes the precomputed ``obj.distances``** produced by
+    :func:`copro.distance.compute_distance` (or ``compute_self_distance``) as-is.
+    It therefore does NOT re-apply the distance-processing options
+    (``dist_type``, ``x/y/z_dist_scale``, ``normalize_distance``,
+    ``normalize_target``, ``truncate``) that only the sparse branch honors --
+    those transforms were already baked into ``obj.distances`` when
+    ``compute_distance`` ran. To obtain kernels identical to the sparse branch
+    (so ``method='auto'`` is result-invariant across the size threshold), run
+    ``compute_distance`` with the SAME distance options you pass to
+    ``compute_kernel_matrix``. ``compute_kernel_matrix`` emits a warning when it
+    can detect that ``obj.distances`` was built with a different normalization
+    state than requested (see ``_dense_distance_state_mismatch``).
+    """
     from .core import CoProMulti
 
     if not obj.distances:
@@ -326,7 +340,14 @@ class _SparseBlock:
 def _coordinate_spec(location_data, dist_type, x_scale, y_scale, z_scale):
     lower_to_actual = {str(c).lower(): c for c in location_data.columns}
     if dist_type is None:
-        dist_type = "Euclidean3D" if "z" in lower_to_actual else "Euclidean2D"
+        # Facet B parity fix: default to Euclidean2D to match distance.py's
+        # compute_distance() default (see distance.py: dist_type="Euclidean2D").
+        # The dense branch consumes the distances produced by compute_distance()
+        # (2D by default even when a z column exists), so the sparse branch must
+        # resolve the SAME default. Historically this auto-selected Euclidean3D
+        # whenever a z column was present, which silently produced 3D sparse
+        # kernels versus 2D dense kernels for the identical default call.
+        dist_type = "Euclidean2D"
     normalized = str(dist_type).lower().replace("_", "").replace("-", "")
     if normalized in {"euclidean2d", "2d"}:
         axes, scales = ["x", "y"], [x_scale, y_scale]
@@ -395,9 +416,17 @@ def _make_sparse_blocks(
             idx_j = idx_i if ct_i == ct_j else np.flatnonzero(
                 slide_mask & (cell_types == ct_j)
             )
-            # Match the dense/R multi-slide path, which ignores tiny slide/type
-            # blocks rather than letting them invalidate an otherwise usable sigma.
-            if is_multi and (idx_i.size <= 5 or idx_j.size <= 5):
+            # Match the dense path's small-block handling so the sparse and
+            # dense key sets agree. distance.py skips any block with <= 5 cells
+            # on (a) every multi-slide block (compute_distance / _compute_*_multi)
+            # and (b) the single-slide SELF path (compute_self_distance). The
+            # single-slide CROSS path (compute_distance pairs) does NOT skip, so
+            # only apply the guard for multi-slide blocks or single-slide self
+            # blocks. Without this, a 2-5 cell single-slide self block produced a
+            # sparse self-kernel the dense path never builds, and a 1-cell self
+            # block reached _low_percentile_block (total = n*(n-1) = 0) and
+            # aborted the entire sparse self-kernel.
+            if (is_multi or self_kernel) and (idx_i.size <= 5 or idx_j.size <= 5):
                 continue
             if idx_i.size == 0 or idx_j.size == 0:
                 warnings.warn(
@@ -438,7 +467,12 @@ def _low_percentile_block(block: _SparseBlock, probability: float) -> tuple[floa
     total = n_a * (n_a - 1) if block.within else n_a * n_b
     if total <= 0:
         raise ValueError(
-            f"Kernel block {block.ct_i}-{block.ct_j} has too few cells for distances."
+            f"Kernel block {block.ct_i}-{block.ct_j} has too few cells "
+            f"({n_a}x{n_b}) to compute a low-distance percentile: a within-type "
+            f"block needs at least 2 cells and a cross-type block needs at least "
+            f"1 cell on each side. Increase min_cells in subset_data(), drop this "
+            f"cell type from cell_types_of_interest, or (for a within/self block) "
+            f"note that types with <= 5 cells are skipped like the dense path."
         )
 
     h = (total - 1) * probability
@@ -709,6 +743,37 @@ def compute_sparse_kernel(
     )
 
 
+def _dense_distance_state_mismatch(obj, normalize_distance: bool):
+    """Best-effort check that precomputed ``obj.distances`` match the requested
+    normalization state, used only to warn on the dense branch.
+
+    The dense branch reuses ``obj.distances`` verbatim, so the
+    distance-processing options passed to :func:`compute_kernel_matrix` are only
+    honored by the sparse branch. We cannot fully reconstruct how
+    ``obj.distances`` was produced, but ``obj.distance_scale_factor`` records
+    whether ``compute_distance`` normalized them (``!= 1``) or not (``== 1``).
+    When that recorded state disagrees with the requested ``normalize_distance``
+    the two branches would diverge, so we surface it rather than silently
+    returning inconsistent kernels. Returns a human-readable detail string when a
+    mismatch is detected, otherwise ``None``.
+    """
+    scale = getattr(obj, "distance_scale_factor", None)
+    if scale is None:
+        return None  # Unknown provenance; do not guess.
+    try:
+        distances_normalized = not np.isclose(float(scale), 1.0)
+    except (TypeError, ValueError):
+        return None
+    if bool(normalize_distance) == distances_normalized:
+        return None
+    return (
+        f"obj.distances appear "
+        f"{'normalized' if distances_normalized else 'un-normalized'} "
+        f"(distance_scale_factor={float(scale):g}), but normalize_distance="
+        f"{bool(normalize_distance)} was requested"
+    )
+
+
 def compute_kernel_matrix(
     obj,
     sigma_values: list,
@@ -732,12 +797,27 @@ def compute_kernel_matrix(
 ):
     """Compute kernels with a dense, sparse, or workload-aware automatic path.
 
-    ``method='dense'`` preserves the original distance-to-kernel behavior.
-    ``method='sparse'`` fuses coordinates, fixed-radius neighbors, and Gaussian
-    evaluation. ``method='auto'`` selects sparse storage when the largest block
-    reaches ``auto_threshold`` cells or total dense entries reach its square.
+    ``method='dense'`` preserves the original distance-to-kernel behavior: it
+    **consumes the precomputed ``obj.distances``** (from ``compute_distance()``)
+    as-is. ``method='sparse'`` fuses coordinates, fixed-radius neighbors, and the
+    Gaussian evaluation, deriving distances directly from the coordinates.
+    ``method='auto'`` selects sparse storage when the largest block reaches
+    ``auto_threshold`` cells or total dense entries reach its square.
     ``drop_distances`` defaults to ``True`` because downstream CoPro steps only
     need kernels; pass ``False`` when distances must remain inspectable.
+
+    Dense/sparse parity (so ``method='auto'`` is result-invariant across the
+    threshold): the distance-processing options ``dist_type``,
+    ``x/y/z_dist_scale``, ``normalize_distance``, ``normalize_target`` and
+    ``truncate`` are honored ONLY by the sparse branch, because the dense branch
+    reuses ``obj.distances`` verbatim. For identical kernels on either branch,
+    run ``compute_distance()`` with the SAME options you pass here. The default
+    ``dist_type`` now resolves to ``Euclidean2D`` on the sparse branch (Facet B),
+    matching ``compute_distance()``'s default, so the default workflow is
+    result-invariant even on x/y/z data. When the dense branch is selected and a
+    normalization mismatch between ``obj.distances`` and the requested
+    ``normalize_distance`` is detectable, a warning is emitted rather than
+    silently returning inconsistent kernels (Facet A).
     """
     cts = list(obj.cell_types_of_interest)
     if not cts:
@@ -767,6 +847,22 @@ def compute_kernel_matrix(
             )
 
     if selected == "dense":
+        # Facet A: the dense branch reuses obj.distances as-is, so the distance
+        # options above are not applied here. Warn on a detectable normalization
+        # mismatch instead of silently returning kernels that differ from the
+        # sparse branch for the same call.
+        mismatch = _dense_distance_state_mismatch(obj, normalize_distance)
+        if mismatch is not None:
+            warnings.warn(
+                "compute_kernel_matrix(method='dense'/auto->dense) reuses the "
+                "precomputed obj.distances; the distance options (dist_type, "
+                "x/y/z_dist_scale, normalize_distance, normalize_target, "
+                "truncate) are honored only on the sparse branch. "
+                f"Detected mismatch: {mismatch}. Re-run compute_distance() with "
+                "matching options (or use method='sparse') for kernels identical "
+                "to the sparse branch.",
+                stacklevel=2,
+            )
         result = _dense_kernel_core(
             obj, sigmas, lower_limit, upper_quantile,
             min_ave_cell_neighbor, row_normalize_kernel,

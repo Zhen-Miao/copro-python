@@ -145,6 +145,10 @@ def test_permutation_correlation_uses_whitened_frobenius_normalizer(monkeypatch)
 
 
 def test_calculate_pvalue_is_phipson_smyth_and_maxes_consistently():
+    # The null draws are scored only at sigma=0.5, so the observed maximum is
+    # restricted to sigma=0.5 as well (DEFECT-2 sigma-matching). The observed
+    # sigma=1.0 rows (value 4.0) are therefore excluded, keeping the
+    # observed/null comparison fair rather than anti-conservative.
     obj = SimpleNamespace(
         normalized_correlation={
             "sigma_0.5": _correlation_frame([2.0, 3.0], sigma=0.5),
@@ -161,8 +165,9 @@ def test_calculate_pvalue_is_phipson_smyth_and_maxes_consistently():
     two_sided = permutation.calculate_pvalue(obj, alternative="two_sided")
 
     np.testing.assert_array_equal(greater["permu_values"], [5.0, 3.0])
-    assert greater["observed"] == 4.0
-    assert greater["p_value"] == pytest.approx(2 / 3)
+    # Observed is max over sigma=0.5 rows only: max(2.0, 3.0) == 3.0.
+    assert greater["observed"] == 3.0
+    assert greater["p_value"] == pytest.approx(1.0)
     assert less["p_value"] == pytest.approx(2 / 3)
     assert two_sided["p_value"] == 1.0
     assert greater["mc_floor"] == pytest.approx(1 / 3)
@@ -171,7 +176,8 @@ def test_calculate_pvalue_is_phipson_smyth_and_maxes_consistently():
     selected = permutation.calculate_pvalue(
         obj, cell_type_1="A", cell_type_2="B"
     )
-    assert selected["observed"] == 4.0
+    # Selected A-B observed restricted to sigma=0.5: value 2.0 (not 4.0).
+    assert selected["observed"] == 2.0
     np.testing.assert_array_equal(selected["permu_values"], [0.0, 2.0])
     assert selected["pair_aggregation"] == "selected"
 

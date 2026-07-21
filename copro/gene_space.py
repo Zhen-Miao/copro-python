@@ -3,8 +3,11 @@
 This module ports the R package's ``runGeneSpaceCCA`` workflow.  Unlike the
 ordinary skrCCA pipeline, it does not use PCA.  It standardizes expression for
 each slide/cell-type block, builds per-slide gene covariance operators, and
-maximizes the average per-slide canonical correlation with a frozen-sigma
-Jacobi iteration.
+iterates a frozen-sigma (Jacobi) update toward a gene-space canonical
+component.  Because each sweep holds the per-slide score standard deviations
+fixed at the previous iterate, the update is a heuristic surrogate for the
+average per-slide canonical-correlation objective rather than a provable
+maximizer of it.
 
 The public entry points are intentionally kept in this standalone module until
 they are re-exported from :mod:`copro`.
@@ -191,11 +194,14 @@ def optimize_genespace_avg_corr(
     verbose: bool = True,
     random_state=0,
 ) -> dict[str, np.ndarray]:
-    """Find the first gene-space canonical component.
+    """Iterate the frozen-sigma update toward the first gene-space component.
 
     The update is a simultaneous (Jacobi) frozen-sigma sweep: all cell-type
-    updates use weights and per-slide score variances from the previous
-    iterate.  ``random_state`` may be an integer or ``numpy.random.Generator``.
+    updates use weights and per-slide score standard deviations from the
+    previous iterate.  Freezing the sigmas within a sweep makes this a
+    heuristic surrogate for the average per-slide canonical-correlation
+    objective, not a provable maximizer of the canonical correlation.
+    ``random_state`` may be an integer or ``numpy.random.Generator``.
     """
     cell_types = list(cell_types)
     slides = list(slides)
@@ -268,11 +274,20 @@ def optimize_genespace_avg_corr(
             stacklevel=2,
         )
 
-    objective = compute_genespace_objective(
-        weights, self_covariances, cross_covariances, slides, cell_types
-    )
-    if objective < 0:
-        weights[cell_types[0]] = -weights[cell_types[0]]
+    # Sign convention. Negating a single cell type's weights flips the sign of
+    # only the pairwise terms that involve it. With exactly 2 cell types there
+    # is a single pair, so flipping ``cell_types[0]`` reliably makes the
+    # objective non-negative (matching R's optimize_genespace_avg_corr). With
+    # >2 cell types the objective sums over C(k, 2) pairs and a single-type
+    # flip cannot control the global sign — a dominant pair not involving
+    # ``cell_types[0]`` keeps its sign — so the orientation / global sign is
+    # left UNDEFINED here rather than applying R's ineffective single-type flip.
+    if len(cell_types) == 2:
+        objective = compute_genespace_objective(
+            weights, self_covariances, cross_covariances, slides, cell_types
+        )
+        if objective < 0:
+            weights[cell_types[0]] = -weights[cell_types[0]]
     return weights
 
 
@@ -378,11 +393,18 @@ def optimize_genespace_avg_corr_n(
                 RuntimeWarning,
                 stacklevel=2,
             )
-        objective = compute_genespace_objective(
-            current, self_covariances, cross_covariances, slides, cell_types
-        )
-        if objective < 0:
-            current[cell_types[0]] = -current[cell_types[0]]
+        # Sign convention (see optimize_genespace_avg_corr): the single-type
+        # flip only controls the objective sign for the 2-cell-type case. With
+        # >2 cell types a single-type flip cannot fix a dominant pair that does
+        # not involve ``cell_types[0]``, so this component's orientation /
+        # global sign is left undefined rather than applying an ineffective flip.
+        if len(cell_types) == 2:
+            objective = compute_genespace_objective(
+                current, self_covariances, cross_covariances,
+                slides, cell_types
+            )
+            if objective < 0:
+                current[cell_types[0]] = -current[cell_types[0]]
         for ct in cell_types:
             out[ct] = np.column_stack((out[ct], current[ct]))
     return out

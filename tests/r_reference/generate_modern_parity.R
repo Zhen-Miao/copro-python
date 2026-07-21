@@ -64,6 +64,79 @@ values <- c(
   )
 )
 
+# --- >2-cell-type multi-set deflation parity (DEFECT 1) --------------------
+# Pins R's canonical projection-deflation scheme for a 3-cell-type problem
+# (used by R whenever n_types > 2 and PCs are whitened, i.e. scale_pcs = TRUE
+# / sdev2_list = NULL).  The Python port must reproduce CC1 and CC2 here, and
+# additionally give the SAME axes under scale_pcs = FALSE via weighted
+# projection (checked separately in tests/test_optimizer_deflation.py).
+X_A <- matrix(c(
+   0.5, -1.2,  0.3,
+   1.1,  0.4, -0.7,
+  -0.9,  0.8,  1.0,
+   0.2, -0.5,  0.6
+), nrow = 4, byrow = TRUE)
+X_B <- matrix(c(
+  -0.3,  1.0,  0.5,
+   0.7, -0.6,  0.9,
+   1.2,  0.1, -0.4,
+  -0.8,  0.5,  0.2
+), nrow = 4, byrow = TRUE)
+X_C <- matrix(c(
+   0.6,  0.2, -1.1,
+  -0.4,  0.9,  0.7,
+   0.3, -0.8,  0.4,
+   1.0,  0.5, -0.2
+), nrow = 4, byrow = TRUE)
+K_AB <- matrix(c(
+  1.0, 0.2, 0.1, 0.0,
+  0.1, 0.9, 0.3, 0.2,
+  0.0, 0.4, 1.1, 0.1,
+  0.3, 0.1, 0.2, 0.8
+), nrow = 4, byrow = TRUE)
+K_AC <- matrix(c(
+  0.9, 0.1, 0.2, 0.1,
+  0.2, 1.0, 0.1, 0.0,
+  0.1, 0.3, 0.8, 0.2,
+  0.0, 0.2, 0.1, 1.1
+), nrow = 4, byrow = TRUE)
+K_BC <- matrix(c(
+  1.1, 0.0, 0.1, 0.2,
+  0.1, 0.8, 0.2, 0.1,
+  0.3, 0.1, 1.0, 0.0,
+  0.2, 0.2, 0.1, 0.9
+), nrow = 4, byrow = TRUE)
+
+mset_sigma <- 0.5
+mset_X <- list(A = X_A, B = X_B, C = X_C)
+mset_kernels <- list()
+mset_kernels[[paste0("kernel|sigma", mset_sigma, "|A|B")]] <- K_AB
+mset_kernels[[paste0("kernel|sigma", mset_sigma, "|A|C")]] <- K_AC
+mset_kernels[[paste0("kernel|sigma", mset_sigma, "|B|C")]] <- K_BC
+
+mset_w1 <- CoPro::optimize_bilinear(
+  mset_X, mset_kernels, mset_sigma,
+  max_iter = 20000, tol = 1e-11, sdev2_list = NULL
+)
+mset_wn <- CoPro::optimize_bilinear_n(
+  mset_X, mset_kernels, mset_sigma, w_list = mset_w1,
+  cellTypesOfInterest = c("A", "B", "C"), nCC = 2,
+  max_iter = 20000, tol = 1e-11, sdev2_list = NULL
+)
+
+mset_values <- numeric(0)
+for (ct in c("A", "B", "C")) {
+  for (ax in 1:2) {
+    v <- mset_wn[[ct]][, ax]
+    for (k in seq_along(v)) {
+      nm <- sprintf("mset_%s_cc%d_%d", ct, ax, k - 1L)
+      mset_values[nm] <- v[k]
+    }
+  }
+}
+
+values <- c(values, mset_values)
+
 dir.create(dirname(output), recursive = TRUE, showWarnings = FALSE)
 write.csv(
   data.frame(metric = names(values), value = as.numeric(values)),

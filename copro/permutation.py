@@ -310,7 +310,17 @@ def _permuted_pc_matrices(
 
 
 def _recover_distance_scale_factor(obj) -> float:
-    """Return the stored mapping from raw to normalized spatial distance."""
+    """Return the CROSS-type mapping from raw to normalized spatial distance.
+
+    This deliberately reads ``obj.distance_scale_factor`` (the CROSS-type factor
+    set by :func:`compute_distance`), never ``self_distance_scale_factor``. The
+    cross-type permutation correlation — and therefore the sigma-aware patch
+    grid in :func:`_sigma_aware_bins` — is defined in CROSS-normalized units, so
+    binning must use the cross factor. This matches R's
+    ``.recoverDistanceScaleFactor`` (C_resampling_function.R), which reads
+    ``@distanceScaleFactor``; R's ``computeSelfDistance`` never overwrites that
+    slot with the within-type factor.
+    """
     scale = getattr(obj, "distance_scale_factor", None)
     if scale is None:
         return np.nan
@@ -742,9 +752,22 @@ def calculate_pvalue(
 ) -> dict:
     """Calculate a Phipson-Smyth permutation p-value.
 
-    By default, the observed statistic and every null draw use the same maximum
-    over all cell-type pairs (and all stored observed sigma rows). Passing both
-    cell-type arguments retains the former pair-specific Python behavior.
+    The observed statistic and every null draw use the same maximum over all
+    cell-type pairs. To keep the observed/null comparison fair, the observed
+    maximum is taken only over the sigma bandwidths the null draws were actually
+    scored at — the distinct ``sigma`` values present in
+    ``normalized_correlation_permu``. For the legacy fixed-sigma null
+    (:func:`compute_normalized_correlation_permu`) that is the single
+    ``sigma_value_choice``; maxing the observed statistic over sigmas the null
+    never used would bias the p-value downward (anti-conservative). For the
+    fair-sigma / conditional nulls each draw already re-maximizes over every
+    sigma, so their frames span the full sigma set and the restriction is a
+    no-op, leaving those workflows unchanged. Passing both cell-type arguments
+    retains the former pair-specific Python behavior.
+
+    The Phipson-Smyth estimator ``(1 + #{null >= obs}) / (n + 1)`` itself is
+    unchanged; only the sigma set over which ``obs`` is maximized is matched to
+    the null.
     """
     if not getattr(obj, "normalized_correlation", None):
         raise ValueError("Run compute_normalized_correlation() first.")
@@ -765,8 +788,32 @@ def calculate_pvalue(
     if alternative not in {"greater", "less", "two.sided"}:
         raise ValueError("alternative must be 'greater', 'less', or 'two.sided'.")
 
-    def statistic(frame: pd.DataFrame) -> float:
+    null_frames = [
+        frame
+        for frame in obj.normalized_correlation_permu.values()
+        if len(frame) > 0
+    ]
+    if not null_frames:
+        raise ValueError("Permutation normalized correlation is empty.")
+
+    # DEFECT-2 fix: restrict the observed maximum to exactly the sigma values
+    # the null draws were scored at, so observed and null share the same sigma
+    # set (see the docstring). ``None`` disables the restriction if the null
+    # frames carry no sigma column (defensive; the pipeline always sets it).
+    null_sigmas = None
+    if all("sigma" in frame.columns for frame in null_frames):
+        collected = set()
+        for frame in null_frames:
+            collected.update(frame["sigma"].to_numpy(dtype=float).tolist())
+        if collected:
+            null_sigmas = collected
+
+    def statistic(frame: pd.DataFrame, restrict_sigmas=None) -> float:
         selected = frame[frame["CC_index"] == cc_index]
+        if restrict_sigmas is not None and "sigma" in selected.columns:
+            selected = selected[
+                selected["sigma"].astype(float).isin(restrict_sigmas)
+            ]
         if cell_type_1 is not None:
             selected = selected[
                 (selected["cell_type_1"] == cell_type_1)
@@ -775,7 +822,8 @@ def calculate_pvalue(
         values = selected["normalized_correlation"].to_numpy(dtype=float)
         if len(values) == 0 or not np.all(np.isfinite(values)):
             raise ValueError(
-                "Normalized correlation is missing or non-finite for cc_index."
+                "Normalized correlation is missing or non-finite for cc_index "
+                "after matching the observed statistic to the null sigma set."
             )
         return float(np.max(values))
 
@@ -784,9 +832,9 @@ def calculate_pvalue(
     ]
     if not observed_frames:
         raise ValueError("Observed normalized correlation is empty.")
-    observed = statistic(pd.concat(observed_frames, ignore_index=True))
+    observed = statistic(pd.concat(observed_frames, ignore_index=True), null_sigmas)
     permu_values = np.asarray(
-        [statistic(frame) for frame in obj.normalized_correlation_permu.values()],
+        [statistic(frame, null_sigmas) for frame in null_frames],
         dtype=float,
     )
     n_permu = len(permu_values)

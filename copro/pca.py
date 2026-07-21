@@ -77,9 +77,16 @@ def compute_pca(obj, n_pca: int = 30, center: bool = True, scale: bool = True):
         elif center:
             sub_scaled = sub - sub.mean(axis=0)
         elif scale:
+            # Use the SAME safeguard as the multi-slide _center_scale() and
+            # utils.center_scale_matrix (R's center_scale_matrix_opt): do not
+            # scale tiny-variance or very-sparse columns. This keeps scale-only
+            # PCA consistent between the single- and multi-slide paths.
             col_sds = sub.std(axis=0, ddof=1)
-            col_sds[col_sds < 1e-10] = 1.0
-            sub_scaled = sub / col_sds
+            col_nz = np.sum(sub != 0, axis=0) / sub.shape[0]
+            col_sds_safe = col_sds.copy()
+            bad_cols = (col_sds < 1e-3) | (col_nz < 0.01)
+            col_sds_safe[bad_cols] = 1.0
+            sub_scaled = sub / col_sds_safe
         else:
             sub_scaled = sub
 
