@@ -1,4 +1,4 @@
-"""SkrCCA power-method optimization — mirrors 04_optimization_function_refactored.R exactly."""
+"""Exact two-type and iterative multi-set skrCCA optimization."""
 
 from __future__ import annotations
 
@@ -20,6 +20,31 @@ def _normalize_vec(v: np.ndarray) -> np.ndarray:
         warnings.warn("Near-zero vector encountered during normalization.")
         return np.zeros((v.size, 1), dtype=float)
     return (v / norm).reshape(-1, 1)
+
+
+def _normalize_vec_weighted(v: np.ndarray, sdev2: np.ndarray | None = None) -> np.ndarray:
+    """Normalize a vector under ``w' diag(sdev2) w = 1``."""
+    if sdev2 is None:
+        return _normalize_vec(v)
+    values = np.asarray(v, dtype=float).ravel()
+    metric = np.asarray(sdev2, dtype=float).ravel()
+    if values.size != metric.size or np.any(metric <= 0) or not np.all(np.isfinite(metric)):
+        raise ValueError("sdev2 must contain one finite positive value per feature.")
+    norm = float(np.sqrt(np.sum(values**2 * metric)))
+    if norm < 1e-12:
+        warnings.warn("Near-zero vector encountered during weighted normalization.")
+        return np.zeros((values.size, 1), dtype=float)
+    return (values / norm).reshape(-1, 1)
+
+
+def _normalize_gradient_weighted(
+    v: np.ndarray, sdev2: np.ndarray | None = None
+) -> np.ndarray:
+    """Apply the diagonal inverse metric, then weighted-normalize."""
+    if sdev2 is None:
+        return _normalize_vec(v)
+    metric = np.asarray(sdev2, dtype=float).ravel()
+    return _normalize_vec_weighted(np.asarray(v).ravel() / metric, metric)
 
 
 def _get_kernel_matrix(flat_kernels: dict, sigma: float, ct_i: str, ct_j: str) -> np.ndarray:
@@ -65,44 +90,16 @@ def _initialize_weights_svd(X_dict: dict, cell_types: list) -> dict:
 
 
 def _check_convergence(w_new: dict, w_old: dict, cell_types: list) -> float:
-    """Return max absolute difference across all weight vectors."""
+    """Return sign-invariant max absolute difference across weight vectors."""
     max_diff = 0.0
     for ct in cell_types:
-        diff = float(np.max(np.abs(w_new[ct] - w_old[ct])))
+        diff_fwd = float(np.max(np.abs(w_new[ct] - w_old[ct])))
+        diff_flip = float(np.max(np.abs(w_new[ct] + w_old[ct])))
+        diff = min(diff_fwd, diff_flip)
         if np.isnan(diff):
             diff = 0.0
         max_diff = max(max_diff, diff)
     return max_diff
-
-
-def _compute_update_standard(
-    ct_i: str,
-    cell_types: list,
-    X_dict: dict,
-    flat_kernels: dict,
-    sigma: float,
-    w_dict: dict,
-    n_features: int,
-) -> np.ndarray:
-    """Update vector for ct_i: sum_j≠i  X_i^T K_ij X_j w_j."""
-    update = np.zeros((n_features, 1), dtype=float)
-    X_i = X_dict[ct_i]
-    for ct_j in cell_types:
-        if ct_i == ct_j:
-            continue
-        K = _get_kernel_matrix(flat_kernels, sigma, ct_i, ct_j)
-        X_j = X_dict[ct_j]
-        w_j = w_dict[ct_j]
-        # X_i^T (K (X_j w_j))
-        v = X_j @ w_j          # (n_cells_j, 1)
-        kv = K @ v              # (n_cells_i, 1)
-        update += X_i.T @ kv   # (n_features, 1)
-    return update
-
-
-def _compute_update_within(X: np.ndarray, K: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """Update vector for within-type: X^T K X w."""
-    return X.T @ (K @ (X @ w))
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +113,10 @@ def optimize_bilinear(
     max_iter: int = 1000,
     tol: float = 1e-5,
     verbose: bool = True,
+    step_size: float = 1.0,
+    sdev2_dict: dict | None = None,
 ) -> dict:
-    """SkrCCA power method — first component.
+    """Compute the first skrCCA component from cached PC-space operators.
 
     Parameters
     ----------
@@ -132,33 +131,20 @@ def optimize_bilinear(
     """
     cell_types = list(X_dict.keys())
     n_features = X_dict[cell_types[0]].shape[1]
-    is_within = len(cell_types) == 1
+    if not 0 < step_size <= 1:
+        raise ValueError("step_size must be in (0, 1].")
+
+    # Build each small PC-space operator only once.  With two types the
+    # constrained problem is exactly the singular-vector variational problem.
+    Y = _compute_Y_resi(X_dict, flat_kernels, sigma, cell_types)
+    if len(cell_types) == 2:
+        return _solve_two_type_svd(Y, cell_types, 1, sdev2_dict)
 
     w_dict = _initialize_weights_svd(X_dict, cell_types)
-
-    for iteration in range(max_iter + 1):
-        w_old = {ct: w_dict[ct].copy() for ct in cell_types}
-
-        if is_within:
-            ct = cell_types[0]
-            X = X_dict[ct]
-            K = _get_kernel_matrix(flat_kernels, sigma, ct, ct)
-            update = _compute_update_within(X, K, w_dict[ct])
-            w_dict[ct] = _normalize_vec(update)
-        else:
-            for ct_i in cell_types:
-                update = _compute_update_standard(
-                    ct_i, cell_types, X_dict, flat_kernels, sigma, w_dict, n_features
-                )
-                w_dict[ct_i] = _normalize_vec(update)
-
-        diff = _check_convergence(w_dict, w_old, cell_types)
-        if diff <= tol:
-            if verbose:
-                print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
-            break
-    else:
-        warnings.warn(f"optimize_bilinear: max_iter={max_iter} reached without convergence.")
+    w_dict = _bilinear_from_Y_resi(
+        w_dict, Y, n_features, max_iter, tol, verbose,
+        step_size=step_size, sdev2_dict=sdev2_dict,
+    )
 
     # Ensure (n_features, 1) shape
     for ct in cell_types:
@@ -197,23 +183,120 @@ def _compute_Y_resi(
     return Y
 
 
-def _apply_deflation(Y: dict, w_dict: dict, qq: int, cell_types: list) -> dict:
-    """Deflate Y matrices using component qq (0-indexed column in w_dict[ct])."""
+def _solve_two_type_svd(
+    Y: dict,
+    cell_types: list,
+    n_cc: int = 1,
+    sdev2_dict: dict | None = None,
+) -> dict:
+    """Solve every ordinary two-type skrCCA axis with one exact SVD."""
+    if len(cell_types) != 2:
+        raise ValueError("The exact SVD solver requires exactly two cell types.")
+    ct1, ct2 = cell_types
+    Y12 = np.asarray(Y[ct1][ct2], dtype=float)
+    max_axes = min(Y12.shape)
+    if n_cc < 1 or n_cc > max_axes:
+        raise ValueError(
+            f"n_cc must be between 1 and {max_axes} for this PC-space operator."
+        )
+
+    inv1 = inv2 = None
+    if sdev2_dict is not None:
+        inv1 = 1.0 / np.sqrt(np.asarray(sdev2_dict[ct1], dtype=float))
+        inv2 = 1.0 / np.sqrt(np.asarray(sdev2_dict[ct2], dtype=float))
+        Y12 = inv1[:, None] * Y12 * inv2[None, :]
+
+    U, _, Vt = np.linalg.svd(Y12, full_matrices=False)
+    W1 = U[:, :n_cc]
+    W2 = Vt.T[:, :n_cc]
+    if sdev2_dict is not None:
+        W1 = inv1[:, None] * W1
+        W2 = inv2[:, None] * W2
+    return {ct1: W1, ct2: W2}
+
+
+def _matches_two_type_first_axis(
+    supplied: dict,
+    exact: dict,
+    cell_types: list,
+    sdev2_dict: dict | None = None,
+    tolerance: float = 1e-4,
+) -> bool:
+    """Whether a supplied first axis is the leading exact singular pair."""
+    cosines = []
+    for ct in cell_types:
+        left = np.asarray(supplied[ct])[:, 0]
+        right = np.asarray(exact[ct])[:, 0]
+        if sdev2_dict is None:
+            num = float(left @ right)
+            den = float(np.linalg.norm(left) * np.linalg.norm(right))
+        else:
+            metric = np.asarray(sdev2_dict[ct], dtype=float)
+            num = float(np.sum(metric * left * right))
+            den = float(
+                np.sqrt(np.sum(metric * left**2) * np.sum(metric * right**2))
+            )
+        cosines.append(num / den if den > 0 else np.nan)
+    return bool(
+        np.all(np.isfinite(cosines))
+        and np.all(np.abs(np.abs(cosines) - 1.0) <= tolerance)
+        and np.prod(np.sign(cosines)) > 0
+    )
+
+
+def _apply_deflation(
+    Y: dict,
+    w_dict: dict,
+    qq: int,
+    cell_types: list,
+    sdev2_dict: dict | None = None,
+    method: str = "rank1",
+) -> dict:
+    """Deflate PC-space operators with rank-one or two-sided projection."""
+    if method not in {"rank1", "projection"}:
+        raise ValueError("method must be 'rank1' or 'projection'.")
+    if method == "projection" and sdev2_dict is not None:
+        raise ValueError("Projection deflation is not defined with weighted metrics.")
     is_within = len(cell_types) == 1
+
+    def project(Y1, w1, w2):
+        u = w1 / np.linalg.norm(w1)
+        v = w2 / np.linalg.norm(w2)
+        return (
+            Y1
+            - u @ (u.T @ Y1)
+            - (Y1 @ v) @ v.T
+            + float((u.T @ Y1 @ v).item()) * (u @ v.T)
+        )
 
     if is_within:
         ct = cell_types[0]
         Y1 = Y[ct][ct]
         w1 = w_dict[ct][:, qq : qq + 1]
-        lam = float((w1.T @ Y1 @ w1).flat[0])
-        Y[ct][ct] = Y1 - lam * (w1 @ w1.T)
+        if method == "projection":
+            Y[ct][ct] = project(Y1, w1, w1)
+        else:
+            lam = float((w1.T @ Y1 @ w1).flat[0])
+            if sdev2_dict is None:
+                left = right = w1
+            else:
+                left = right = w1 * np.asarray(sdev2_dict[ct])[:, None]
+            Y[ct][ct] = Y1 - lam * (left @ right.T)
     else:
         for ct_i, ct_j in combinations(cell_types, 2):
             w1 = w_dict[ct_i][:, qq : qq + 1]
             w2 = w_dict[ct_j][:, qq : qq + 1]
             Y1 = Y[ct_i][ct_j]
-            lam = float((w1.T @ Y1 @ w2).flat[0])
-            Y[ct_i][ct_j] = Y1 - lam * (w1 @ w2.T)
+            if method == "projection":
+                Y[ct_i][ct_j] = project(Y1, w1, w2)
+            else:
+                lam = float((w1.T @ Y1 @ w2).flat[0])
+                if sdev2_dict is None:
+                    left, right = w1, w2
+                else:
+                    left = w1 * np.asarray(sdev2_dict[ct_i])[:, None]
+                    right = w2 * np.asarray(sdev2_dict[ct_j])[:, None]
+                Y[ct_i][ct_j] = Y1 - lam * (left @ right.T)
             Y[ct_j][ct_i] = Y[ct_i][ct_j].T
 
     return Y
@@ -262,6 +345,8 @@ def _bilinear_from_Y_resi(
     max_iter: int,
     tol: float,
     verbose: bool = True,
+    step_size: float = 1.0,
+    sdev2_dict: dict | None = None,
 ) -> dict:
     """Iterative refinement using precomputed (deflated) Y matrices."""
     cell_types = list(w_new.keys())
@@ -272,7 +357,16 @@ def _bilinear_from_Y_resi(
 
         if is_within:
             ct = cell_types[0]
-            w_new[ct] = _normalize_vec(Y[ct][ct] @ w_new[ct])
+            update = _normalize_gradient_weighted(
+                Y[ct][ct] @ w_new[ct],
+                None if sdev2_dict is None else sdev2_dict[ct],
+            )
+            if step_size < 1:
+                update = _normalize_vec_weighted(
+                    (1 - step_size) * w_old[ct] + step_size * update,
+                    None if sdev2_dict is None else sdev2_dict[ct],
+                )
+            w_new[ct] = update
         else:
             for ct_i in cell_types:
                 update = np.zeros((n_features, 1), dtype=float)
@@ -283,7 +377,14 @@ def _bilinear_from_Y_resi(
                     if Y_ij is None:
                         raise ValueError(f"Missing Y_resi for ({ct_i}, {ct_j})")
                     update += Y_ij @ w_new[ct_j]
-                w_new[ct_i] = _normalize_vec(update)
+                metric = None if sdev2_dict is None else sdev2_dict[ct_i]
+                update = _normalize_gradient_weighted(update, metric)
+                if step_size < 1:
+                    update = _normalize_vec_weighted(
+                        (1 - step_size) * w_old[ct_i] + step_size * update,
+                        metric,
+                    )
+                w_new[ct_i] = update
 
         diff = _check_convergence(w_new, w_old, cell_types)
         if diff <= tol:
@@ -306,6 +407,8 @@ def optimize_bilinear_n(
     max_iter: int = 1000,
     tol: float = 1e-5,
     verbose: bool = True,
+    step_size: float = 1.0,
+    sdev2_dict: dict | None = None,
 ) -> dict:
     """Compute components 2 … n_cc via deflation.
 
@@ -325,15 +428,33 @@ def optimize_bilinear_n(
 
     Y = _compute_Y_resi(X_dict, flat_kernels, sigma, cell_types)
 
+    if len(cell_types) == 2:
+        exact = _solve_two_type_svd(Y, cell_types, n_cc, sdev2_dict)
+        if _matches_two_type_first_axis(
+            w_dict, exact, cell_types, sdev2_dict=sdev2_dict
+        ):
+            return exact
+
     for qq in range(k_start - 1, n_cc - 1):
         # Deflate using component qq
-        Y = _apply_deflation(Y, w_dict, qq, cell_types)
+        method = (
+            "projection"
+            if len(cell_types) > 2 and sdev2_dict is None
+            else "rank1"
+        )
+        Y = _apply_deflation(
+            Y, w_dict, qq, cell_types,
+            sdev2_dict=sdev2_dict, method=method,
+        )
 
         # Initialize next component
         w_new = _initialize_next_component(Y, cell_types)
 
         # Refine
-        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol, verbose=verbose)
+        w_new = _bilinear_from_Y_resi(
+            w_new, Y, n_features, max_iter, tol, verbose=verbose,
+            step_size=step_size, sdev2_dict=sdev2_dict,
+        )
 
         # Append to w_dict
         for ct in cell_types:
@@ -346,6 +467,57 @@ def optimize_bilinear_n(
 # Multi-slide optimization
 # ---------------------------------------------------------------------------
 
+def _compute_Y_multi_slides(
+    X_list_all: dict,
+    flat_kernels: dict,
+    sigma: float,
+    slides: list,
+    cell_types: list,
+) -> dict:
+    """Sum PC-space operators over slides without stacking cells or kernels."""
+    n_features = X_list_all[slides[0]][cell_types[0]].shape[1]
+    Y = {ct: {} for ct in cell_types}
+    if len(cell_types) == 1:
+        ct = cell_types[0]
+        total = np.zeros((n_features, n_features), dtype=float)
+        for slide in slides:
+            X = X_list_all.get(slide, {}).get(ct)
+            if X is None:
+                continue
+            try:
+                K = _get_kernel_matrix_flat_multi(
+                    flat_kernels, sigma, ct, ct, slide
+                )
+            except KeyError:
+                continue
+            total += X.T @ (K @ X)
+        Y[ct][ct] = total
+        return Y
+
+    for ct_i, ct_j in combinations(cell_types, 2):
+        total = np.zeros((n_features, n_features), dtype=float)
+        found = False
+        for slide in slides:
+            X_i = X_list_all.get(slide, {}).get(ct_i)
+            X_j = X_list_all.get(slide, {}).get(ct_j)
+            if X_i is None or X_j is None:
+                continue
+            try:
+                K = _get_kernel_matrix_flat_multi(
+                    flat_kernels, sigma, ct_i, ct_j, slide
+                )
+            except KeyError:
+                continue
+            total += X_i.T @ (K @ X_j)
+            found = True
+        if not found:
+            raise KeyError(
+                f"No kernel blocks found for pair ({ct_i}, {ct_j}) at sigma={sigma}."
+            )
+        Y[ct_i][ct_j] = total
+        Y[ct_j][ct_i] = total.T
+    return Y
+
 def optimize_bilinear_multi_slides(
     X_list_all: dict,   # {slide: {ct: ndarray}}
     flat_kernels: dict,
@@ -354,6 +526,8 @@ def optimize_bilinear_multi_slides(
     max_iter: int = 1000,
     tol: float = 1e-5,
     verbose: bool = True,
+    step_size: float = 1.0,
+    sdev2_dict: dict | None = None,
 ) -> dict:
     """SkrCCA first component, multi-slide. Shared weights, sums contributions across slides.
 
@@ -361,7 +535,25 @@ def optimize_bilinear_multi_slides(
     """
     cell_types = list(X_list_all[slides[0]].keys())
     n_features = X_list_all[slides[0]][cell_types[0]].shape[1]
-    is_within = len(cell_types) == 1
+    Y = _compute_Y_multi_slides(
+        X_list_all, flat_kernels, sigma, slides, cell_types
+    )
+
+    if len(cell_types) == 2:
+        return _solve_two_type_svd(Y, cell_types, 1, sdev2_dict)
+
+    if len(cell_types) == 1:
+        ct = cell_types[0]
+        Y_sym = (Y[ct][ct] + Y[ct][ct].T) * 0.5
+        metric = None if sdev2_dict is None else np.asarray(sdev2_dict[ct])
+        if metric is not None:
+            inv = 1.0 / np.sqrt(metric)
+            Y_sym = inv[:, None] * Y_sym * inv[None, :]
+        values, vectors = np.linalg.eigh(Y_sym)
+        w = vectors[:, -1:]
+        if metric is not None:
+            w = _normalize_vec_weighted(inv[:, None] * w, metric)
+        return {ct: w}
 
     # Initialize weights from stacked data across all slides
     w_dict = {}
@@ -378,46 +570,10 @@ def optimize_bilinear_multi_slides(
                 _, _, Vt = np.linalg.svd(X_stacked, full_matrices=False)
                 w_dict[ct] = Vt[0].reshape(-1, 1)
 
-    for iteration in range(max_iter + 1):
-        w_old = {ct: w_dict[ct].copy() for ct in cell_types}
-
-        if is_within:
-            ct = cell_types[0]
-            update = np.zeros((n_features, 1), dtype=float)
-            for slide in slides:
-                X = X_list_all[slide].get(ct)
-                if X is None:
-                    continue
-                try:
-                    K = _get_kernel_matrix_flat_multi(flat_kernels, sigma, ct, ct, slide)
-                except KeyError:
-                    continue
-                update += X.T @ (K @ (X @ w_dict[ct]))
-            w_dict[ct] = _normalize_vec(update)
-        else:
-            for ct_i in cell_types:
-                update = np.zeros((n_features, 1), dtype=float)
-                for ct_j in cell_types:
-                    if ct_i == ct_j:
-                        continue
-                    w_j = w_dict[ct_j]
-                    for slide in slides:
-                        try:
-                            X_i = X_list_all[slide][ct_i]
-                            X_j = X_list_all[slide][ct_j]
-                            K = _get_kernel_matrix_flat_multi(flat_kernels, sigma, ct_i, ct_j, slide)
-                        except KeyError:
-                            continue
-                        update += X_i.T @ (K @ (X_j @ w_j))
-                w_dict[ct_i] = _normalize_vec(update)
-
-        diff = _check_convergence(w_dict, w_old, cell_types)
-        if diff <= tol:
-            if verbose:
-                print(f"Convergence reached at iteration {iteration} (max_diff={diff:.3e})")
-            break
-    else:
-        warnings.warn(f"optimize_bilinear_multi_slides: max_iter={max_iter} reached without convergence.")
+    w_dict = _bilinear_from_Y_resi(
+        w_dict, Y, n_features, max_iter, tol, verbose,
+        step_size=step_size, sdev2_dict=sdev2_dict,
+    )
 
     for ct in cell_types:
         w_dict[ct] = w_dict[ct].reshape(-1, 1)
@@ -435,6 +591,8 @@ def optimize_bilinear_n_multi_slides(
     max_iter: int = 1000,
     tol: float = 1e-5,
     verbose: bool = True,
+    step_size: float = 1.0,
+    sdev2_dict: dict | None = None,
 ) -> dict:
     """Compute components 2..n_cc for multi-slide via deflation."""
     n_features = X_list_all[slides[0]][cell_types[0]].shape[1]
@@ -443,46 +601,32 @@ def optimize_bilinear_n_multi_slides(
     if n_cc <= k_start:
         raise ValueError(f"n_cc ({n_cc}) must be > existing components ({k_start}).")
 
-    def _make_Y_aggregate():
-        """Compute Y_aggregate[ct_i][ct_j] = Σ_q X_{i,q}^T K_{ij,q} X_{j,q}"""
-        is_within = len(cell_types) == 1
-        Y = {ct: {} for ct in cell_types}
-        if is_within:
-            ct = cell_types[0]
-            Y_sum = np.zeros((n_features, n_features))
-            for slide in slides:
-                try:
-                    X = X_list_all[slide].get(ct)
-                    if X is None:
-                        continue
-                    K = _get_kernel_matrix_flat_multi(flat_kernels, sigma, ct, ct, slide)
-                    Y_sum += X.T @ (K @ X)
-                except KeyError:
-                    pass
-            Y[ct][ct] = Y_sum
-        else:
-            for ct_i, ct_j in combinations(cell_types, 2):
-                Y_sum = np.zeros((n_features, n_features))
-                for slide in slides:
-                    try:
-                        X_i = X_list_all[slide].get(ct_i)
-                        X_j = X_list_all[slide].get(ct_j)
-                        if X_i is None or X_j is None:
-                            continue
-                        K = _get_kernel_matrix_flat_multi(flat_kernels, sigma, ct_i, ct_j, slide)
-                        Y_sum += X_i.T @ (K @ X_j)
-                    except KeyError:
-                        pass
-                Y[ct_i][ct_j] = Y_sum
-                Y[ct_j][ct_i] = Y_sum.T
-        return Y
+    Y = _compute_Y_multi_slides(
+        X_list_all, flat_kernels, sigma, slides, cell_types
+    )
 
-    Y = _make_Y_aggregate()
+    if len(cell_types) == 2:
+        exact = _solve_two_type_svd(Y, cell_types, n_cc, sdev2_dict)
+        if _matches_two_type_first_axis(
+            w_dict, exact, cell_types, sdev2_dict=sdev2_dict
+        ):
+            return exact
 
     for qq in range(k_start - 1, n_cc - 1):
-        Y = _apply_deflation(Y, w_dict, qq, cell_types)
+        method = (
+            "projection"
+            if len(cell_types) > 2 and sdev2_dict is None
+            else "rank1"
+        )
+        Y = _apply_deflation(
+            Y, w_dict, qq, cell_types,
+            sdev2_dict=sdev2_dict, method=method,
+        )
         w_new = _initialize_next_component(Y, cell_types)
-        w_new = _bilinear_from_Y_resi(w_new, Y, n_features, max_iter, tol, verbose=verbose)
+        w_new = _bilinear_from_Y_resi(
+            w_new, Y, n_features, max_iter, tol, verbose=verbose,
+            step_size=step_size, sdev2_dict=sdev2_dict,
+        )
         for ct in cell_types:
             w_dict[ct] = np.hstack([w_dict[ct], w_new[ct]])
 

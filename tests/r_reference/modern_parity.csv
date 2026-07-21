@@ -1,0 +1,7 @@
+metric,value
+whitened_frob,0.920269686720309
+bidir_none_cc1,-0.0147814896915625
+bidir_none_cc2,0.280970537137005
+bidir_row_col_cc1,0.131636385742834
+bidir_row_col_cc2,0.193331107652007
+gene_space_objective,0.146928751968263

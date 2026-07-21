@@ -32,7 +32,13 @@ def _process_distance_matrix(
 
     # Replace zeros (overlapping cells) with smallest non-zero
     if np.any(dist_mat == 0):
-        min_nz = np.min(dist_mat[dist_mat > 0]) if np.any(dist_mat > 0) else 1.0
+        positive = dist_mat[np.isfinite(dist_mat) & (dist_mat > 0)]
+        if len(positive) == 0:
+            raise ValueError(
+                "All spatial coordinates in a distance block are coincident; "
+                "no positive distance is available."
+            )
+        min_nz = np.min(positive)
         dist_mat[dist_mat == 0] = min_nz
         warnings.warn(
             "Zero distances detected; replaced with smallest non-zero distance."
@@ -60,6 +66,10 @@ def compute_distance(
     dist_type: str = "Euclidean2D",
     normalize: bool = True,
     truncate: bool = True,
+    normalize_target: float = 0.01,
+    x_dist_scale: float = 1.0,
+    y_dist_scale: float = 1.0,
+    z_dist_scale: float = 1.0,
 ):
     """Compute pairwise Euclidean distance matrices between all cell-type pairs.
 
@@ -69,23 +79,31 @@ def compute_distance(
     For single-slide, 1 type: within-type (ct, ct) stored under 'dist|ct|ct'.
     For multi-slide: keys include slide: 'dist|{slide}|ct_i|ct_j'.
 
-    Normalization: scales so 0.001th-percentile distance (across all pairs) equals 0.01.
+    Normalization scales the low-distance percentile across all blocks to
+    ``normalize_target`` (0.01 by default).
     """
+    _validate_normalize_target(normalize_target)
     from .core import CoProMulti
     if isinstance(obj, CoProMulti):
-        return _compute_distance_multi(obj, dist_type, normalize, truncate)
+        return _compute_distance_multi(
+            obj, dist_type, normalize, truncate, normalize_target,
+            x_dist_scale, y_dist_scale, z_dist_scale,
+        )
 
     # --- Single-slide path ---
     cts = obj.cell_types_of_interest
     if not cts:
         raise ValueError("No cell types of interest. Run subset_data() first.")
 
-    if dist_type != "Euclidean2D":
-        raise NotImplementedError(f"dist_type '{dist_type}' not implemented. Use 'Euclidean2D'.")
+    coord_cols, coord_scales = _distance_coordinate_spec(
+        dist_type, x_dist_scale, y_dist_scale, z_dist_scale
+    )
 
     loc = obj.location_data_sub
-    if not {"x", "y"}.issubset(loc.columns):
-        raise ValueError("location_data_sub must have columns 'x' and 'y'.")
+    if not set(coord_cols).issubset(loc.columns):
+        raise ValueError(
+            f"location_data_sub must have columns {coord_cols!r} for {dist_type}."
+        )
 
     distances = {}
 
@@ -93,7 +111,7 @@ def compute_distance(
         # Within-type only
         ct = cts[0]
         mask = obj.cell_types_sub == ct
-        coords = loc.loc[mask, ["x", "y"]].values.astype(float)
+        coords = loc.loc[mask, coord_cols].values.astype(float) * coord_scales
         dist_mat = cdist(coords, coords)
         dist_mat, dist_percentile = _process_distance_matrix(
             dist_mat, truncate, percentile_choice=1e-4, set_diag_inf=True
@@ -102,8 +120,11 @@ def compute_distance(
         distances[flat_name] = dist_mat
 
         if normalize:
-            scaling_factor = 0.01 / dist_percentile
+            scaling_factor = normalize_target / dist_percentile
             distances[flat_name] = dist_mat * scaling_factor
+            obj.distance_scale_factor = scaling_factor
+        else:
+            obj.distance_scale_factor = 1.0
 
     else:
         # Between-type pairs
@@ -114,8 +135,8 @@ def compute_distance(
         for ct_i, ct_j in pairs:
             mask_i = obj.cell_types_sub == ct_i
             mask_j = obj.cell_types_sub == ct_j
-            coords_i = loc.loc[mask_i, ["x", "y"]].values.astype(float)
-            coords_j = loc.loc[mask_j, ["x", "y"]].values.astype(float)
+            coords_i = loc.loc[mask_i, coord_cols].values.astype(float) * coord_scales
+            coords_j = loc.loc[mask_j, coord_cols].values.astype(float) * coord_scales
 
             dist_mat = cdist(coords_i, coords_j)
             dist_mat, dist_pct = _process_distance_matrix(dist_mat, truncate)
@@ -126,11 +147,13 @@ def compute_distance(
 
         if normalize:
             min_percentile = min(dist_percentiles)
-            scaling_factor = 0.01 / min_percentile
+            scaling_factor = normalize_target / min_percentile
             for flat_name, dist_mat in raw_mats.items():
                 distances[flat_name] = dist_mat * scaling_factor
+            obj.distance_scale_factor = scaling_factor
         else:
             distances = raw_mats
+            obj.distance_scale_factor = 1.0
 
     obj.distances = distances
     return obj
@@ -142,6 +165,10 @@ def compute_self_distance(
     normalize: bool = True,
     truncate: bool = True,
     verbose: bool = True,
+    normalize_target: float = 0.01,
+    x_dist_scale: float = 1.0,
+    y_dist_scale: float = 1.0,
+    z_dist_scale: float = 1.0,
 ):
     """Compute within-cell-type distance matrices when multiple cell types are present.
 
@@ -152,9 +179,13 @@ def compute_self_distance(
 
     Dispatches to multi-slide version for CoProMulti objects.
     """
+    _validate_normalize_target(normalize_target)
     from .core import CoProMulti
     if isinstance(obj, CoProMulti):
-        return _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose)
+        return _compute_self_distance_multi(
+            obj, dist_type, normalize, truncate, verbose, normalize_target,
+            x_dist_scale, y_dist_scale, z_dist_scale,
+        )
 
     cts = obj.cell_types_of_interest
     if not cts:
@@ -163,8 +194,9 @@ def compute_self_distance(
         warnings.warn("Only one cell type — use compute_distance() instead.")
         return obj
 
-    if dist_type != "Euclidean2D":
-        raise NotImplementedError(f"dist_type '{dist_type}' not implemented.")
+    coord_cols, coord_scales = _distance_coordinate_spec(
+        dist_type, x_dist_scale, y_dist_scale, z_dist_scale
+    )
 
     loc = obj.location_data_sub
     all_percentiles = []
@@ -172,7 +204,7 @@ def compute_self_distance(
 
     for ct in cts:
         mask = obj.cell_types_sub == ct
-        coords = loc.loc[mask, ["x", "y"]].values.astype(float)
+        coords = loc.loc[mask, coord_cols].values.astype(float) * coord_scales
         if len(coords) <= 5:
             if verbose:
                 print(f"Skipping self-distance for {ct}: only {len(coords)} cells.")
@@ -188,24 +220,32 @@ def compute_self_distance(
 
     if normalize and all_percentiles:
         min_pct = min(all_percentiles)
-        scaling = 0.01 / min_pct
+        scaling = normalize_target / min_pct
+        obj.distance_scale_factor = scaling
         if verbose:
             print(f"Self-distance scaling factor: {scaling:.4f}")
         for k, v in raw_mats.items():
             obj.distances[k] = v * scaling
     else:
+        obj.distance_scale_factor = 1.0
         for k, v in raw_mats.items():
             obj.distances[k] = v
 
     return obj
 
 
-def _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose):
+def _compute_self_distance_multi(
+    obj, dist_type, normalize, truncate, verbose, normalize_target,
+    x_dist_scale, y_dist_scale, z_dist_scale,
+):
     """Multi-slide self-distance. Adds 'dist|{slide}|ct|ct' entries."""
     cts = obj.cell_types_of_interest
     slides = obj.slide_list
     slide_ids = obj.meta_data_sub["slideID"].values
     loc = obj.location_data_sub
+    coord_cols, coord_scales = _distance_coordinate_spec(
+        dist_type, x_dist_scale, y_dist_scale, z_dist_scale
+    )
 
     if len(cts) == 1:
         warnings.warn("Only one cell type — use compute_distance() instead.")
@@ -222,7 +262,7 @@ def _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose):
                 if verbose:
                     print(f"Skipping self-distance for {ct} in {slide}: {n} cells.")
                 continue
-            coords = loc.loc[mask, ["x", "y"]].values.astype(float)
+            coords = loc.loc[mask, coord_cols].values.astype(float) * coord_scales
             dist_mat = cdist(coords, coords)
             dist_mat, pct = _process_distance_matrix(
                 dist_mat, truncate, percentile_choice=1e-4, set_diag_inf=True,
@@ -233,27 +273,38 @@ def _compute_self_distance_multi(obj, dist_type, normalize, truncate, verbose):
 
     if normalize and all_percentiles:
         min_pct = min(all_percentiles)
-        scaling = 0.01 / min_pct
+        scaling = normalize_target / min_pct
+        obj.distance_scale_factor = scaling
         if verbose:
             print(f"Global self-distance scaling factor: {scaling:.4f}")
         for k, v in raw_mats.items():
             obj.distances[k] = v * scaling
     else:
+        obj.distance_scale_factor = 1.0
         for k, v in raw_mats.items():
             obj.distances[k] = v
 
     return obj
 
 
-def _compute_distance_multi(obj, dist_type="Euclidean2D", normalize=True, truncate=True):
+def _compute_distance_multi(
+    obj, dist_type="Euclidean2D", normalize=True, truncate=True,
+    normalize_target=0.01, x_dist_scale=1.0, y_dist_scale=1.0,
+    z_dist_scale=1.0,
+):
     """Multi-slide distance computation. Keys: 'dist|{slide}|ct_i|ct_j'."""
     cts = obj.cell_types_of_interest
     slides = obj.slide_list
     slide_ids = obj.meta_data_sub["slideID"].values
     loc = obj.location_data_sub
+    coord_cols, coord_scales = _distance_coordinate_spec(
+        dist_type, x_dist_scale, y_dist_scale, z_dist_scale
+    )
 
-    if not {"x", "y"}.issubset(loc.columns):
-        raise ValueError("location_data_sub must have columns 'x' and 'y'.")
+    if not set(coord_cols).issubset(loc.columns):
+        raise ValueError(
+            f"location_data_sub must have columns {coord_cols!r} for {dist_type}."
+        )
 
     distances = {}
     all_percentiles = []
@@ -265,7 +316,7 @@ def _compute_distance_multi(obj, dist_type="Euclidean2D", normalize=True, trunca
             slide_ct_mask = (obj.cell_types_sub == ct) & (slide_ids == slide)
             if np.sum(slide_ct_mask) <= 5:
                 continue
-            coords = loc.loc[slide_ct_mask, ["x", "y"]].values.astype(float)
+            coords = loc.loc[slide_ct_mask, coord_cols].values.astype(float) * coord_scales
             dist_mat = cdist(coords, coords)
             dist_mat, pct = _process_distance_matrix(dist_mat, truncate, percentile_choice=1e-4, set_diag_inf=True)
             flat_name = f"dist|{slide}|{ct}|{ct}"
@@ -279,8 +330,8 @@ def _compute_distance_multi(obj, dist_type="Euclidean2D", normalize=True, trunca
                 mask_j = (obj.cell_types_sub == ct_j) & (slide_ids == slide)
                 if np.sum(mask_i) <= 5 or np.sum(mask_j) <= 5:
                     continue
-                coords_i = loc.loc[mask_i, ["x", "y"]].values.astype(float)
-                coords_j = loc.loc[mask_j, ["x", "y"]].values.astype(float)
+                coords_i = loc.loc[mask_i, coord_cols].values.astype(float) * coord_scales
+                coords_j = loc.loc[mask_j, coord_cols].values.astype(float) * coord_scales
                 dist_mat = cdist(coords_i, coords_j)
                 dist_mat, pct = _process_distance_matrix(dist_mat, truncate)
                 flat_name = f"dist|{slide}|{ct_i}|{ct_j}"
@@ -289,11 +340,40 @@ def _compute_distance_multi(obj, dist_type="Euclidean2D", normalize=True, trunca
 
     if normalize and all_percentiles:
         global_min = min(all_percentiles)
-        scaling_factor = 0.01 / global_min
+        scaling_factor = normalize_target / global_min
+        obj.distance_scale_factor = scaling_factor
         for k, v in raw_mats.items():
             distances[k] = v * scaling_factor
     else:
         distances = raw_mats
+        obj.distance_scale_factor = 1.0
 
     obj.distances = distances
     return obj
+
+
+def _distance_coordinate_spec(
+    dist_type: str,
+    x_dist_scale: float,
+    y_dist_scale: float,
+    z_dist_scale: float,
+) -> tuple[list[str], np.ndarray]:
+    """Validate a Euclidean distance mode and return columns/axis scales."""
+    if dist_type not in {"Euclidean2D", "Euclidean3D"}:
+        raise NotImplementedError(
+            f"dist_type '{dist_type}' is not implemented; use Euclidean2D or Euclidean3D."
+        )
+    scales = [x_dist_scale, y_dist_scale]
+    cols = ["x", "y"]
+    if dist_type == "Euclidean3D":
+        cols.append("z")
+        scales.append(z_dist_scale)
+    scales_arr = np.asarray(scales, dtype=float)
+    if not np.all(np.isfinite(scales_arr)) or np.any(scales_arr <= 0):
+        raise ValueError("Distance scale factors must be finite and positive.")
+    return cols, scales_arr
+
+
+def _validate_normalize_target(value: float) -> None:
+    if not np.isscalar(value) or not np.isfinite(value) or value <= 0:
+        raise ValueError("normalize_target must be a finite positive scalar.")

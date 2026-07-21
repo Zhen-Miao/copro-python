@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy import sparse
 from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import svd_flip
 
@@ -65,6 +66,10 @@ def compute_pca(obj, n_pca: int = 30, center: bool = True, scale: bool = True):
     for ct in cts:
         mask = obj.cell_types_sub == ct
         sub = obj.normalized_data_sub[mask].astype(float)
+        if sparse.issparse(sub):
+            # Densify only the already-subsetted cell type, never the full
+            # AnnData matrix. Centered PCA is inherently dense.
+            sub = sub.toarray()
 
         # Center and scale
         if center and scale:
@@ -124,6 +129,8 @@ def _compute_pca_multi(obj, n_pca=30, center=True, scale=True):
     for ct in cts:
         mask_ct = obj.cell_types_sub == ct
         X_ct = obj.normalized_data_sub[mask_ct].astype(float)
+        if sparse.issparse(X_ct):
+            X_ct = X_ct.toarray()
         slide_ct = slide_ids[mask_ct]
 
         k = min(n_pca, X_ct.shape[0] - 1, X_ct.shape[1] - 1)

@@ -18,6 +18,11 @@ EXPR_FILE = DATA_DIR / "alternative_round1_expression.parquet"
 META_FILE = DATA_DIR / "alternative_round1_metadata.parquet"
 REF_DIR = Path(__file__).parent / "r_reference" / "alt_round1"
 
+pytestmark = pytest.mark.skipif(
+    not (EXPR_FILE.exists() and META_FILE.exists()),
+    reason="optional spatial-simulation integration dataset is unavailable",
+)
+
 SIGMA_VALUES = [0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.5]
 CELL_TYPES = ["A", "B"]
 N_PCA = 25

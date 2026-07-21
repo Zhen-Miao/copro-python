@@ -430,7 +430,11 @@ def plot_permutation(
 
     ax.set_xlabel("Normalized Correlation")
     ax.set_ylabel("Count")
-    pair_str = f"{result['cell_type_1']}–{result['cell_type_2']}"
+    pair_str = (
+        "max over pairs"
+        if result["cell_type_1"] is None
+        else f"{result['cell_type_1']}–{result['cell_type_2']}"
+    )
     ax.set_title(f"Permutation Test — {pair_str} CC{cc_index}\n"
                  f"p = {result['p_value']:.4f} (n={result['n_permu']})")
     ax.legend(fontsize=8)

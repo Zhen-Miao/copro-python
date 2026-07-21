@@ -34,6 +34,20 @@ def _prepare_pc_matrices(
 def _prepare_pc_matrices_multi(obj, scale_pcs: bool, cell_types: list) -> dict:
     """Return {slide: {ct: X_scaled}} for multi-slide."""
     slides = obj.slide_list
+
+    # Match the R implementation's structural validation: shared multi-slide
+    # weights require every requested cell type to have a PCA score matrix on
+    # every slide.  Silently skipping a missing entry is especially dangerous
+    # when it occurs on the first slide because the optimizer infers its cell
+    # types from that slide and can otherwise return an incomplete result.
+    for slide in slides:
+        slide_results = obj.pca_results.get(slide)
+        for ct in cell_types:
+            if slide_results is None or slide_results.get(ct) is None:
+                raise ValueError(
+                    f"Missing PCA data for slide '{slide}', cell type '{ct}'."
+                )
+
     result = {slide: {} for slide in slides}
     for ct in cell_types:
         pca = obj.pca_global[ct]
@@ -41,8 +55,6 @@ def _prepare_pc_matrices_multi(obj, scale_pcs: bool, cell_types: list) -> dict:
         sdev_safe = sdev.copy()
         sdev_safe[sdev_safe < 1e-10] = 1.0
         for slide in slides:
-            if slide not in obj.pca_results or ct not in obj.pca_results[slide]:
-                continue
             scores = obj.pca_results[slide][ct].astype(float)
             if scale_pcs:
                 scores = scores / sdev_safe[np.newaxis, :]
@@ -56,15 +68,22 @@ def run_skr_cca(
     n_cc: int = 2,
     tol: float = 1e-5,
     max_iter: int = 500,
+    step_size: float = 1.0,
+    sigma_choice: float | None = None,
+    verbose: bool = True,
 ):
     """Run SkrCCA optimization for all sigma values.
 
     Dispatches to multi-slide version for CoProMulti objects.
-    Stores results in obj.skr_cca_out['sigma_{sigma}'][ct] = w_matrix (n_pca, n_cc).
+    Stores one ``(n_pca, n_cc)`` weight matrix per sigma and cell type in
+    ``obj.skr_cca_out``.
     """
     from .core import CoProMulti
     if isinstance(obj, CoProMulti):
-        return _run_skr_cca_multi(obj, scale_pcs, n_cc, tol, max_iter)
+        return _run_skr_cca_multi(
+            obj, scale_pcs, n_cc, tol, max_iter,
+            step_size=step_size, sigma_choice=sigma_choice, verbose=verbose,
+        )
 
     # --- Single-slide path ---
     cts = obj.cell_types_of_interest
@@ -76,11 +95,24 @@ def run_skr_cca(
         raise ValueError("PCA results missing. Run compute_pca() first.")
 
     X_dict = _prepare_pc_matrices(obj, scale_pcs, cts)
+    _validate_optimizer_args(X_dict, n_cc, tol, max_iter, step_size)
+    sdev2_dict = None if scale_pcs else {
+        ct: np.asarray(obj.pca_global[ct]["sdev"], dtype=float) ** 2
+        for ct in cts
+    }
+    sigmas = obj.sigma_values
+    if sigma_choice is not None:
+        if sigma_choice not in sigmas:
+            raise ValueError(
+                f"sigma_choice={sigma_choice} is unavailable; choose from {sigmas}."
+            )
+        sigmas = [sigma_choice]
 
     cca_out = {}
-    for sigma in obj.sigma_values:
+    for sigma in sigmas:
         sigma_name = f"sigma_{sigma}"
-        print(f"Running SkrCCA for sigma = {sigma}")
+        if verbose:
+            print(f"Running SkrCCA for sigma = {sigma}")
 
         try:
             # First component
@@ -90,6 +122,9 @@ def run_skr_cca(
                 sigma=sigma,
                 max_iter=max_iter,
                 tol=tol,
+                verbose=verbose,
+                step_size=step_size,
+                sdev2_dict=sdev2_dict,
             )
 
             # Additional components
@@ -103,6 +138,9 @@ def run_skr_cca(
                     n_cc=n_cc,
                     max_iter=max_iter,
                     tol=tol,
+                    verbose=verbose,
+                    step_size=step_size,
+                    sdev2_dict=sdev2_dict,
                 )
 
             cca_out[sigma_name] = w_dict
@@ -125,6 +163,8 @@ def run_skr_cca_supervised(
     n_cc: int = 4,
     tol: float = 1e-5,
     max_iter: int = 500,
+    step_size: float = 1.0,
+    verbose: bool = True,
 ):
     """Run SkrCCA with user-supplied first-component weights (supervised/guided mode).
 
@@ -166,20 +206,32 @@ def run_skr_cca_supervised(
             raise ValueError(f"supervised_weights missing key '{ct}'.")
 
     X_dict = _prepare_pc_matrices(obj, scale_pcs, cts)
+    _validate_optimizer_args(X_dict, n_cc, tol, max_iter, step_size)
+    sdev2_dict = None if scale_pcs else {
+        ct: np.asarray(obj.pca_global[ct]["sdev"], dtype=float) ** 2
+        for ct in cts
+    }
     obj.scale_pcs = scale_pcs
     obj.n_cc = n_cc
 
     cca_out = {}
     for sigma in obj.sigma_values:
         sigma_name = f"sigma_{sigma}"
-        print(f"Running supervised SkrCCA for sigma = {sigma}")
+        if verbose:
+            print(f"Running supervised SkrCCA for sigma = {sigma}")
 
         # First component: use supervised weights (normalised)
         w_dict = {}
         for ct in cts:
             w = np.asarray(supervised_weights[ct], dtype=float).ravel()
-            w = w / np.linalg.norm(w)
-            w_dict[ct] = w.reshape(-1, 1)
+            metric = None if sdev2_dict is None else sdev2_dict[ct]
+            if metric is None:
+                norm = np.linalg.norm(w)
+            else:
+                norm = np.sqrt(np.sum(w**2 * metric))
+            if norm < 1e-12:
+                raise ValueError(f"supervised_weights['{ct}'] has near-zero norm.")
+            w_dict[ct] = (w / norm).reshape(-1, 1)
 
         # Additional components via standard optimization
         if n_cc > 1:
@@ -192,6 +244,9 @@ def run_skr_cca_supervised(
                 n_cc=n_cc,
                 max_iter=max_iter,
                 tol=tol,
+                verbose=verbose,
+                step_size=step_size,
+                sdev2_dict=sdev2_dict,
             )
 
         cca_out[sigma_name] = w_dict
@@ -200,25 +255,47 @@ def run_skr_cca_supervised(
     return obj
 
 
-def _run_skr_cca_multi(obj, scale_pcs, n_cc, tol, max_iter):
+def _run_skr_cca_multi(
+    obj, scale_pcs, n_cc, tol, max_iter,
+    step_size=1.0, sigma_choice=None, verbose=True,
+):
     """Multi-slide SkrCCA optimization. Shared weight vectors across slides."""
     from .optimization import optimize_bilinear_multi_slides, optimize_bilinear_n_multi_slides
     cts = obj.cell_types_of_interest
     slides = obj.slide_list
     X_list_all = _prepare_pc_matrices_multi(obj, scale_pcs, cts)
+    first_slide = next((s for s in slides if X_list_all.get(s)), None)
+    if first_slide is None:
+        raise ValueError("No per-slide PCA matrices are available.")
+    _validate_optimizer_args(X_list_all[first_slide], n_cc, tol, max_iter, step_size)
+    sdev2_dict = None if scale_pcs else {
+        ct: np.asarray(obj.pca_global[ct]["sdev"], dtype=float) ** 2
+        for ct in cts
+    }
+    sigmas = obj.sigma_values
+    if sigma_choice is not None:
+        if sigma_choice not in sigmas:
+            raise ValueError(
+                f"sigma_choice={sigma_choice} is unavailable; choose from {sigmas}."
+            )
+        sigmas = [sigma_choice]
 
     cca_out = {}
-    for sigma in obj.sigma_values:
+    for sigma in sigmas:
         sigma_name = f"sigma_{sigma}"
-        print(f"Running SkrCCA (multi) for sigma = {sigma}")
+        if verbose:
+            print(f"Running SkrCCA (multi) for sigma = {sigma}")
         try:
             w_dict = optimize_bilinear_multi_slides(
-                X_list_all, obj.kernel_matrices, sigma, slides, max_iter, tol
+                X_list_all, obj.kernel_matrices, sigma, slides, max_iter, tol,
+                verbose=verbose, step_size=step_size, sdev2_dict=sdev2_dict,
             )
             if n_cc > 1:
                 w_dict = optimize_bilinear_n_multi_slides(
                     X_list_all, obj.kernel_matrices, sigma, slides,
-                    w_dict, cts, n_cc, max_iter, tol
+                    w_dict, cts, n_cc, max_iter, tol,
+                    verbose=verbose, step_size=step_size,
+                    sdev2_dict=sdev2_dict,
                 )
             cca_out[sigma_name] = w_dict
         except Exception as e:
@@ -230,3 +307,17 @@ def _run_skr_cca_multi(obj, scale_pcs, n_cc, tol, max_iter):
     obj.n_cc = n_cc
     obj.scale_pcs = scale_pcs
     return obj
+
+
+def _validate_optimizer_args(X_dict, n_cc, tol, max_iter, step_size):
+    if not isinstance(n_cc, (int, np.integer)) or n_cc < 1:
+        raise ValueError("n_cc must be a positive integer.")
+    max_axes = min(np.asarray(X).shape[1] for X in X_dict.values())
+    if n_cc > max_axes:
+        raise ValueError(f"n_cc={n_cc} exceeds the available PC dimension ({max_axes}).")
+    if not np.isfinite(tol) or tol <= 0:
+        raise ValueError("tol must be finite and positive.")
+    if not isinstance(max_iter, (int, np.integer)) or max_iter < 1:
+        raise ValueError("max_iter must be a positive integer.")
+    if not np.isfinite(step_size) or not 0 < step_size <= 1:
+        raise ValueError("step_size must be in (0, 1].")

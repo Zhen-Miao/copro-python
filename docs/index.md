@@ -4,7 +4,7 @@
 
 CoPro detects **coordinated spatial progressions** between cell types in spatial transcriptomics data. Given the spatial positions and gene expression profiles of cells, CoPro finds a low-dimensional axis along which cells of one type are spatially co-organized with cells of another type — or within a single cell type — revealing continuous tissue structure that discrete clustering misses.
 
-The method is built on **Spatial Kernel Restricted CCA (SkrCCA)**: a power-method optimization that maximizes a spatially-weighted cross-covariance between cell type-specific PC score matrices.
+The method is built on **Spatial Kernel Restricted CCA (SkrCCA)**. The Python package supports exact two-type multi-axis SVD, projection-deflated multi-set optimization, exact sparse kernels, gene-space multi-slide CCA, and conditional permutation inference.
 
 !!! note "R package"
     The original R implementation is available at [github.com/Zhen-Miao/CoPro](https://github.com/Zhen-Miao/CoPro).
@@ -43,4 +43,4 @@ scores_A = obj.cell_scores[f"cellScores|sigma{sigma}|Cell type A"][:, 0]
 
 If you use CoPro in your research, please cite:
 
-> Miao Z. et al. *CoPro: Unsupervised detection of coordinated spatial progressions in spatial transcriptomics* (in preparation).
+> Miao Z, Qu Y, Huang S, Laux L, Peters S, Aristel A, Zhang Z, Niedernhofer L, McMahon A, Kim J, Zhang NR (2026). *Dissecting the coordinated progression of cell states in spatial transcriptomics with CoPro.* bioRxiv 2026.04.17.719309. https://doi.org/10.64898/2026.04.17.719309

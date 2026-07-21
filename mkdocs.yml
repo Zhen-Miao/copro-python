@@ -52,6 +52,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Installation: installation.md
+  - Large datasets: large_datasets.md
   - Tutorials:
     - One cell type (Organoid): tutorials/one_cell_type.md
     - Two cell types (MERFISH): tutorials/two_cell_types.md

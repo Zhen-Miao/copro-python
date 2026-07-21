@@ -32,6 +32,16 @@ def compute_gene_and_cell_scores(obj):
         raise ValueError("No cell types of interest.")
     if not obj.skr_cca_out:
         raise ValueError("CCA results missing. Run run_skr_cca() first.")
+    if not any(
+        obj.skr_cca_out.get(f"sigma_{sigma}") is not None
+        for sigma in obj.sigma_values
+    ):
+        if any(str(key).startswith("gscca_sigma_") for key in obj.skr_cca_out):
+            raise ValueError(
+                "Only gene-space CCA results are present. run_gene_space_cca() "
+                "already stores gene and cell scores directly."
+            )
+        raise ValueError("No usable PCA-space skrCCA results are present.")
     if not obj.pca_global:
         raise ValueError("PCA results missing. Run compute_pca() first.")
 
@@ -40,8 +50,8 @@ def compute_gene_and_cell_scores(obj):
 
     X_dict = _prepare_pc_matrices(obj, scale_pcs, cts)
 
-    cell_scores = {}
-    gene_scores = {}
+    cell_scores = dict(obj.cell_scores)
+    gene_scores = dict(obj.gene_scores)
 
     for sigma in obj.sigma_values:
         sigma_name = f"sigma_{sigma}"
@@ -87,11 +97,21 @@ def _compute_scores_multi(obj):
     slides = obj.slide_list
     scale_pcs = getattr(obj, "scale_pcs", True)
     n_cc = obj.n_cc
+    if not any(
+        obj.skr_cca_out.get(f"sigma_{sigma}") is not None
+        for sigma in obj.sigma_values
+    ):
+        if any(str(key).startswith("gscca_sigma_") for key in obj.skr_cca_out):
+            raise ValueError(
+                "Only gene-space CCA results are present. run_gene_space_cca() "
+                "already stores gene and cell scores directly."
+            )
+        raise ValueError("No usable PCA-space skrCCA results are present.")
 
     X_list_all = _prepare_pc_matrices_multi(obj, scale_pcs, cts)
 
-    cell_scores = {}
-    gene_scores = {}
+    cell_scores = dict(obj.cell_scores)
+    gene_scores = dict(obj.gene_scores)
 
     for sigma in obj.sigma_values:
         sigma_name = f"sigma_{sigma}"
