@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy import sparse
 from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import svd_flip
 
@@ -65,6 +66,10 @@ def compute_pca(obj, n_pca: int = 30, center: bool = True, scale: bool = True):
     for ct in cts:
         mask = obj.cell_types_sub == ct
         sub = obj.normalized_data_sub[mask].astype(float)
+        if sparse.issparse(sub):
+            # Densify only the already-subsetted cell type, never the full
+            # AnnData matrix. Centered PCA is inherently dense.
+            sub = sub.toarray()
 
         # Center and scale
         if center and scale:
@@ -72,9 +77,16 @@ def compute_pca(obj, n_pca: int = 30, center: bool = True, scale: bool = True):
         elif center:
             sub_scaled = sub - sub.mean(axis=0)
         elif scale:
+            # Use the SAME safeguard as the multi-slide _center_scale() and
+            # utils.center_scale_matrix (R's center_scale_matrix_opt): do not
+            # scale tiny-variance or very-sparse columns. This keeps scale-only
+            # PCA consistent between the single- and multi-slide paths.
             col_sds = sub.std(axis=0, ddof=1)
-            col_sds[col_sds < 1e-10] = 1.0
-            sub_scaled = sub / col_sds
+            col_nz = np.sum(sub != 0, axis=0) / sub.shape[0]
+            col_sds_safe = col_sds.copy()
+            bad_cols = (col_sds < 1e-3) | (col_nz < 0.01)
+            col_sds_safe[bad_cols] = 1.0
+            sub_scaled = sub / col_sds_safe
         else:
             sub_scaled = sub
 
@@ -124,6 +136,8 @@ def _compute_pca_multi(obj, n_pca=30, center=True, scale=True):
     for ct in cts:
         mask_ct = obj.cell_types_sub == ct
         X_ct = obj.normalized_data_sub[mask_ct].astype(float)
+        if sparse.issparse(X_ct):
+            X_ct = X_ct.toarray()
         slide_ct = slide_ids[mask_ct]
 
         k = min(n_pca, X_ct.shape[0] - 1, X_ct.shape[1] - 1)

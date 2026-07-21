@@ -1,24 +1,87 @@
-"""compute_normalized_correlation() — spectral-norm normalized CCA correlation."""
+"""Normalized spatial correlations and bidirectional score correlations."""
 
 from __future__ import annotations
 
 from itertools import combinations
+import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.sparse.linalg import svds
+from scipy import sparse
 
 from .core import CoProSingle
 from .skrcca import _prepare_pc_matrices
 
 
-def _spectral_norm(K: np.ndarray, tol: float = 1e-4) -> float:
-    """Largest singular value of K (spectral norm)."""
+def _whitened_frob_norm(K, Rx=None, Ry=None) -> float:
+    """Return the centered, whitened Frobenius null standard deviation.
+
+    This is ``||Rx^(1/2) Kc Ry^(1/2)||_F``, where ``Kc`` is the
+    double-centered cross-kernel.  When either within-type kernel is absent,
+    the function falls back to ``||Kc||_F``.  The sparse branch uses an
+    equivalent sparse-plus-low-rank expansion and never materializes the
+    dense centered cross-kernel.
+    """
+    all_sparse = sparse.issparse(K) and (
+        Rx is None or sparse.issparse(Rx)
+    ) and (Ry is None or sparse.issparse(Ry))
+
+    if all_sparse:
+        K = K.tocsr().astype(float)
+        nr, nc = K.shape
+        rmean = np.asarray(K.mean(axis=1)).ravel()
+        cmean = np.asarray(K.mean(axis=0)).ravel()
+        grand_mean = float(cmean.mean())
+
+        if Rx is None or Ry is None:
+            norm2 = (
+                float(K.multiply(K).sum())
+                - nc * float(rmean @ rmean)
+                - nr * float(cmean @ cmean)
+                + nr * nc * grand_mean**2
+            )
+            return float(np.sqrt(max(norm2, 0.0)))
+
+        Rx = ((Rx + Rx.T) * 0.5).tocsr()
+        Ry = ((Ry + Ry.T) * 0.5).tocsr()
+        M = (Rx @ K) @ Ry
+        U = np.column_stack((-rmean, np.ones(nr)))
+        V = np.column_stack((np.ones(nc), grand_mean - cmean))
+        base_term = float(M.multiply(K).sum())
+        cross_term = float(np.sum(U * (M @ V)))
+        rank_term = float(np.sum((U.T @ (Rx @ U)) * (V.T @ (Ry @ V))))
+        return float(np.sqrt(max(base_term + 2.0 * cross_term + rank_term, 0.0)))
+
+    K_arr = K.toarray() if sparse.issparse(K) else np.asarray(K, dtype=float)
+    Kc = (
+        K_arr
+        - K_arr.mean(axis=1, keepdims=True)
+        - K_arr.mean(axis=0, keepdims=True)
+        + K_arr.mean()
+    )
+    if Rx is None or Ry is None:
+        return float(np.linalg.norm(Kc, ord="fro"))
+
+    Rx_arr = Rx.toarray() if sparse.issparse(Rx) else np.asarray(Rx, dtype=float)
+    Ry_arr = Ry.toarray() if sparse.issparse(Ry) else np.asarray(Ry, dtype=float)
+    Rx_arr = (Rx_arr + Rx_arr.T) * 0.5
+    Ry_arr = (Ry_arr + Ry_arr.T) * 0.5
+    norm2 = float(np.sum(((Rx_arr @ Kc) @ Ry_arr) * Kc))
+    return float(np.sqrt(max(norm2, 0.0)))
+
+
+def _kernel_normalizer(flat_kernels, sigma, ct_i, ct_j, slide=None) -> float:
+    """Compute the matched-sigma whitened-Frobenius normalizer for a pair."""
+    K = _get_kernel_for_pair(flat_kernels, sigma, ct_i, ct_j, slide)
     try:
-        s = svds(K.astype(float), k=1, tol=tol, return_singular_vectors=False)
-        return float(s[0])
-    except Exception:
-        return float(np.linalg.norm(K, ord=2))
+        Rx = _get_kernel_for_pair(flat_kernels, sigma, ct_i, ct_i, slide)
+    except KeyError:
+        Rx = None
+    try:
+        Ry = _get_kernel_for_pair(flat_kernels, sigma, ct_j, ct_j, slide)
+    except KeyError:
+        Ry = None
+    return _whitened_frob_norm(K, Rx, Ry)
 
 
 
@@ -37,14 +100,16 @@ def _get_kernel_for_pair(flat_kernels, sigma, ct_i, ct_j, slide=None):
     raise KeyError(f"Kernel not found for ({ct_i},{ct_j}) sigma={sigma} slide={slide}")
 
 
-def compute_normalized_correlation(obj, tol: float = 1e-4):
+def compute_normalized_correlation(
+    obj, tol: float = 1e-4, calculation_mode: str = "per_slide"
+):
     """Compute normalized CCA correlation for each sigma × pair × CC.
 
     Dispatches to multi-slide version for CoProMulti objects.
 
     Formula:
         numerator   = (A @ w1)^T K (B @ w2)
-        denominator = ||A @ w1|| * ||B @ w2|| * ||K||_spec
+        denominator = ||A @ w1|| * ||B @ w2|| * whitened_frob(K)
         norm_corr   = numerator / denominator
 
     Stores in obj.normalized_correlation[sigma_name] = DataFrame.
@@ -52,7 +117,7 @@ def compute_normalized_correlation(obj, tol: float = 1e-4):
     """
     from .core import CoProMulti
     if isinstance(obj, CoProMulti):
-        return _compute_normalized_correlation_multi(obj, tol)
+        return _compute_normalized_correlation_multi(obj, tol, calculation_mode)
 
     # --- Single-slide path ---
     cts = obj.cell_types_of_interest
@@ -73,21 +138,21 @@ def compute_normalized_correlation(obj, tol: float = 1e-4):
     else:
         pairs = list(combinations(cts, 2))
 
-    print("Calculating spectral norms (may take a while)...")
+    print("Calculating whitened-Frobenius normalizers (may take a while)...")
 
-    # Precompute spectral norms for each sigma × pair
-    spec_norms = {}
+    # Precompute matched-sigma normalizers for each sigma × pair.
+    kernel_norms = {}
     for sigma in obj.sigma_values:
-        spec_norms[sigma] = {}
+        kernel_norms[sigma] = {}
         for ct_i, ct_j in pairs:
             try:
-                K = _get_kernel_for_pair(obj.kernel_matrices, sigma, ct_i, ct_j)
-                spec_norms[sigma][(ct_i, ct_j)] = _spectral_norm(K, tol=tol)
-                spec_norms[sigma][(ct_j, ct_i)] = spec_norms[sigma][(ct_i, ct_j)]
+                val = _kernel_normalizer(obj.kernel_matrices, sigma, ct_i, ct_j)
+                kernel_norms[sigma][(ct_i, ct_j)] = val
+                kernel_norms[sigma][(ct_j, ct_i)] = val
             except KeyError:
-                spec_norms[sigma][(ct_i, ct_j)] = np.nan
+                kernel_norms[sigma][(ct_i, ct_j)] = np.nan
 
-    print("Finished calculating spectral norms.")
+    print("Finished calculating whitened-Frobenius normalizers.")
 
     correlation_value = {}
 
@@ -105,7 +170,7 @@ def compute_normalized_correlation(obj, tol: float = 1e-4):
                 K = _get_kernel_for_pair(obj.kernel_matrices, sigma, ct_i, ct_j)
             except KeyError:
                 continue
-            norm_K = spec_norms[sigma].get((ct_i, ct_j), np.nan)
+            norm_K = kernel_norms[sigma].get((ct_i, ct_j), np.nan)
 
             for cc in range(n_cc):
                 w1 = w_sigma[ct_i][:, cc : cc + 1]
@@ -146,46 +211,45 @@ def compute_normalized_correlation(obj, tol: float = 1e-4):
     return obj
 
 
-def _compute_normalized_correlation_multi(obj, tol=1e-4):
+def _compute_normalized_correlation_multi(
+    obj, tol=1e-4, calculation_mode="per_slide"
+):
     """Multi-slide normalized correlation: per-slide values matching R format.
 
     R computes normalized correlation independently for each slide using the
-    raw (unscaled) per-slide PCA scores from pcaResults (not scaled by sdev).
-    We replicate this: for each (sigma, slide, pair, CC), compute norm_corr
-    using only that slide's raw PCA scores and per-slide spectral norm.
+    same PC scaling as optimization.  For each (sigma, slide, pair, CC), this
+    uses the per-slide matched-sigma whitened-Frobenius normalizer.
     Sigma choice is based on the mean CC1 correlation across slides.
     """
     cts = obj.cell_types_of_interest
     slides = obj.slide_list
     n_cc = obj.n_cc
+    if calculation_mode not in {"per_slide", "aggregate"}:
+        raise ValueError("calculation_mode must be 'per_slide' or 'aggregate'.")
 
-    # Use raw (unscaled) per-slide PCA scores — matching R's pcaResults usage
-    X_list_all = {
-        slide: {ct: obj.pca_results[slide][ct].astype(float)
-                for ct in cts if ct in obj.pca_results.get(slide, {})}
-        for slide in slides
-    }
+    from .skrcca import _prepare_pc_matrices_multi
+    X_list_all = _prepare_pc_matrices_multi(obj, obj.scale_pcs, cts)
 
     if len(cts) == 1:
         pairs = [(cts[0], cts[0])]
     else:
         pairs = list(combinations(cts, 2))
 
-    # Precompute per-slide spectral norms for each sigma × pair
-    print("Calculating spectral norms (multi-slide)...")
-    spec_norms = {}  # spec_norms[sigma][(ct_i, ct_j, slide)]
+    print("Calculating whitened-Frobenius normalizers (multi-slide)...")
+    kernel_norms = {}
     for sigma in obj.sigma_values:
-        spec_norms[sigma] = {}
+        kernel_norms[sigma] = {}
         for ct_i, ct_j in pairs:
             for slide in slides:
                 try:
-                    K = _get_kernel_for_pair(obj.kernel_matrices, sigma, ct_i, ct_j, slide)
-                    val = _spectral_norm(K, tol)
+                    val = _kernel_normalizer(
+                        obj.kernel_matrices, sigma, ct_i, ct_j, slide
+                    )
                 except KeyError:
                     val = np.nan
-                spec_norms[sigma][(ct_i, ct_j, slide)] = val
-                spec_norms[sigma][(ct_j, ct_i, slide)] = val
-    print("Finished spectral norms.")
+                kernel_norms[sigma][(ct_i, ct_j, slide)] = val
+                kernel_norms[sigma][(ct_j, ct_i, slide)] = val
+    print("Finished whitened-Frobenius normalizers.")
 
     correlation_value = {}
 
@@ -201,6 +265,51 @@ def _compute_normalized_correlation_multi(obj, tol=1e-4):
                 w1 = w_sigma[ct_i][:, cc:cc+1]
                 w2 = w_sigma[ct_j][:, cc:cc+1]
 
+                if calculation_mode == "aggregate":
+                    total_numerator = 0.0
+                    total_norm_i = 0.0
+                    total_norm_j = 0.0
+                    total_kernel_norm = 0.0
+                    valid_count = 0
+                    for slide in slides:
+                        A = X_list_all[slide].get(ct_i)
+                        B = X_list_all[slide].get(ct_j)
+                        if A is None or B is None:
+                            continue
+                        try:
+                            K = _get_kernel_for_pair(
+                                obj.kernel_matrices, sigma, ct_i, ct_j, slide
+                            )
+                        except KeyError:
+                            continue
+                        norm_K = kernel_norms[sigma].get(
+                            (ct_i, ct_j, slide), np.nan
+                        )
+                        if not np.isfinite(norm_K) or norm_K < 1e-9:
+                            continue
+                        Aw1 = A @ w1
+                        Bw2 = B @ w2
+                        total_numerator += float((Aw1.T @ K @ Bw2).item())
+                        total_norm_i += float(np.sum(Aw1**2))
+                        total_norm_j += float(np.sum(Bw2**2))
+                        total_kernel_norm += norm_K
+                        valid_count += 1
+                    if valid_count:
+                        denom = (
+                            np.sqrt(total_norm_i)
+                            * np.sqrt(total_norm_j)
+                            * (total_kernel_norm / valid_count)
+                        )
+                        value = 0.0 if abs(denom) < 1e-9 else total_numerator / denom
+                        rows.append({
+                            "sigma": sigma,
+                            "cell_type_1": ct_i,
+                            "cell_type_2": ct_j,
+                            "CC_index": cc + 1,
+                            "normalized_correlation": value,
+                        })
+                    continue
+
                 # Per-slide correlation (matches R format)
                 for slide in slides:
                     A = X_list_all[slide].get(ct_i)
@@ -212,7 +321,7 @@ def _compute_normalized_correlation_multi(obj, tol=1e-4):
                     except KeyError:
                         continue
 
-                    norm_K = spec_norms[sigma].get((ct_i, ct_j, slide), np.nan)
+                    norm_K = kernel_norms[sigma].get((ct_i, ct_j, slide), np.nan)
                     Aw1 = A @ w1
                     Bw2 = B @ w2
                     numerator = float((Aw1.T @ K @ Bw2).flat[0])
@@ -264,8 +373,9 @@ def compute_bidir_correlation(
 
     bidir_corr = mean( cor(K^T @ A_w, B_w),  cor(A_w, K @ B_w) )
 
-    Unlike normalized correlation (which uses spectral norm), this metric
-    uses standard Pearson correlation of the kernel-smoothed scores.
+    Unlike normalized correlation (which uses a whitened-Frobenius null
+    standard deviation), this metric uses standard Pearson correlation of the
+    kernel-smoothed scores.
 
     Stores results in ``obj.bidir_correlation[sigma_name]`` as DataFrames.
 
@@ -330,20 +440,23 @@ def compute_bidir_correlation(
             B_all = B @ W_j  # (n_B, n_cc)
 
             # Filter kernel
-            K_use = K.copy()
-            A_use = A_all.copy()
-            B_use = B_all.copy()
             if filter_kernel:
-                row_keep = K_use.sum(axis=1) > K_row_sum_cutoff
-                K_use = K_use[row_keep]
-                A_use = A_use[row_keep]
-                col_keep = K_use.sum(axis=0) > K_col_sum_cutoff
-                K_use = K_use[:, col_keep]
-                B_use = B_use[col_keep]
-
-            corrs = _compute_bidir_corrs_all_cc(
-                A_use, B_use, K_use, normalize_K
-            )
+                filtered = _filter_cross_kernel(
+                    K, A_all, B_all, K_row_sum_cutoff, K_col_sum_cutoff
+                )
+            else:
+                filtered = (K.copy(), A_all.copy(), B_all.copy())
+            if filtered is None:
+                warnings.warn(
+                    f"Kernel filtering removed all cells for {ct_i}-{ct_j}; "
+                    "returning zero bidirectional correlation."
+                )
+                corrs = np.zeros(n_cc)
+            else:
+                K_use, A_use, B_use = filtered
+                corrs = _compute_bidir_corrs_all_cc(
+                    A_use, B_use, K_use, normalize_K
+                )
 
             for cc in range(n_cc):
                 rows.append({
@@ -368,12 +481,8 @@ def _compute_bidir_correlation_multi(
     slides = obj.slide_list
     n_cc = obj.n_cc
 
-    # Raw per-slide PCA scores
-    X_list_all = {
-        slide: {ct: obj.pca_results[slide][ct].astype(float)
-                for ct in cts if ct in obj.pca_results.get(slide, {})}
-        for slide in slides
-    }
+    from .skrcca import _prepare_pc_matrices_multi
+    X_list_all = _prepare_pc_matrices_multi(obj, obj.scale_pcs, cts)
 
     if len(cts) == 1:
         pairs = [(cts[0], cts[0])]
@@ -407,20 +516,23 @@ def _compute_bidir_correlation_multi(
                 A_all = A_raw @ W_i
                 B_all = B_raw @ W_j
 
-                K_use = K.copy()
-                A_use = A_all.copy()
-                B_use = B_all.copy()
                 if filter_kernel:
-                    row_keep = K_use.sum(axis=1) > K_row_sum_cutoff
-                    K_use = K_use[row_keep]
-                    A_use = A_use[row_keep]
-                    col_keep = K_use.sum(axis=0) > K_col_sum_cutoff
-                    K_use = K_use[:, col_keep]
-                    B_use = B_use[col_keep]
-
-                corrs = _compute_bidir_corrs_all_cc(
-                    A_use, B_use, K_use, normalize_K
-                )
+                    filtered = _filter_cross_kernel(
+                        K, A_all, B_all, K_row_sum_cutoff, K_col_sum_cutoff
+                    )
+                else:
+                    filtered = (K.copy(), A_all.copy(), B_all.copy())
+                if filtered is None:
+                    warnings.warn(
+                        f"Kernel filtering removed all cells for {ct_i}-{ct_j} "
+                        f"in {slide}; returning zero bidirectional correlation."
+                    )
+                    corrs = np.zeros(n_cc)
+                else:
+                    K_use, A_use, B_use = filtered
+                    corrs = _compute_bidir_corrs_all_cc(
+                        A_use, B_use, K_use, normalize_K
+                    )
 
                 for cc in range(n_cc):
                     rows.append({
@@ -499,15 +611,23 @@ def compute_self_bidir_correlation(
             A_all = X_dict[ct] @ W  # (n_cells, n_cc)
 
             # Filter (square kernel — same cells on both dims)
-            K_use = K.copy()
-            A_use = A_all.copy()
             if filter_kernel:
-                keep = (K_use.sum(axis=1) > K_row_sum_cutoff) & \
-                       (K_use.sum(axis=0) > K_col_sum_cutoff)
-                K_use = K_use[np.ix_(keep, keep)]
-                A_use = A_use[keep]
-
-            corrs = _compute_self_bidir_corrs_all_cc(A_use, K_use, normalize_K)
+                filtered = _filter_self_kernel(
+                    K, A_all, K_row_sum_cutoff, K_col_sum_cutoff
+                )
+            else:
+                filtered = (K.copy(), A_all.copy())
+            if filtered is None:
+                warnings.warn(
+                    f"Self-kernel filtering removed all cells for {ct}; "
+                    "returning zero bidirectional correlation."
+                )
+                corrs = np.zeros(n_cc)
+            else:
+                K_use, A_use = filtered
+                corrs = _compute_self_bidir_corrs_all_cc(
+                    A_use, K_use, normalize_K
+                )
 
             for cc in range(n_cc):
                 rows.append({
@@ -536,11 +656,8 @@ def _compute_self_bidir_correlation_multi(
         warnings.warn("Only one cell type — use compute_bidir_correlation() instead.")
         return obj
 
-    X_list_all = {
-        slide: {ct: obj.pca_results[slide][ct].astype(float)
-                for ct in cts if ct in obj.pca_results.get(slide, {})}
-        for slide in slides
-    }
+    from .skrcca import _prepare_pc_matrices_multi
+    X_list_all = _prepare_pc_matrices_multi(obj, obj.scale_pcs, cts)
 
     self_bidir = {}
     for sigma in obj.sigma_values:
@@ -563,15 +680,23 @@ def _compute_self_bidir_correlation_multi(
 
                 A_all = A_raw @ W
 
-                K_use = K.copy()
-                A_use = A_all.copy()
                 if filter_kernel:
-                    keep = (K_use.sum(axis=1) > K_row_sum_cutoff) & \
-                           (K_use.sum(axis=0) > K_col_sum_cutoff)
-                    K_use = K_use[np.ix_(keep, keep)]
-                    A_use = A_use[keep]
-
-                corrs = _compute_self_bidir_corrs_all_cc(A_use, K_use, normalize_K)
+                    filtered = _filter_self_kernel(
+                        K, A_all, K_row_sum_cutoff, K_col_sum_cutoff
+                    )
+                else:
+                    filtered = (K.copy(), A_all.copy())
+                if filtered is None:
+                    warnings.warn(
+                        f"Self-kernel filtering removed all cells for {ct} in "
+                        f"{slide}; returning zero bidirectional correlation."
+                    )
+                    corrs = np.zeros(n_cc)
+                else:
+                    K_use, A_use = filtered
+                    corrs = _compute_self_bidir_corrs_all_cc(
+                        A_use, K_use, normalize_K
+                    )
 
                 for cc in range(n_cc):
                     rows.append({
@@ -603,12 +728,7 @@ def _compute_self_bidir_corrs_all_cc(
     n_cc = A_all.shape[1]
 
     if normalize_K == "row_or_col":
-        rs = K.sum(axis=1, keepdims=True)
-        rs[rs < 1e-12] = 1.0
-        K_row = K / rs
-        cs = K.sum(axis=0, keepdims=True)
-        cs[cs < 1e-12] = 1.0
-        K_col = K / cs
+        K_row, K_col = _row_and_col_normalized(K)
         KtA = K_row.T @ A_all
         KA = K_col @ A_all
     elif normalize_K == "sinkhorn_knopp":
@@ -642,16 +762,26 @@ def _sinkhorn_knopp(
 ) -> np.ndarray:
     """Sinkhorn-Knopp doubly-stochastic normalization."""
     K = K.copy().astype(float)
-    K[K < 0] = 0.0
+    if sparse.issparse(K):
+        K.data[K.data < 0] = 0.0
+        K.eliminate_zeros()
+    else:
+        K[K < 0] = 0.0
     for _ in range(max_iter):
-        rs = K.sum(axis=1, keepdims=True)
+        rs = _axis_sum(K, 1)
         rs[rs < 1e-12] = 1.0
-        K = K / rs
-        cs = K.sum(axis=0, keepdims=True)
+        if sparse.issparse(K):
+            K = sparse.diags(1.0 / rs) @ K
+        else:
+            K = K / rs[:, None]
+        cs = _axis_sum(K, 0)
         cs[cs < 1e-12] = 1.0
-        K = K / cs
-        if (np.abs(K.sum(axis=1) - 1).max() < tol and
-                np.abs(K.sum(axis=0) - 1).max() < tol):
+        if sparse.issparse(K):
+            K = K @ sparse.diags(1.0 / cs)
+        else:
+            K = K / cs[None, :]
+        if (np.abs(_axis_sum(K, 1) - 1).max() < tol and
+                np.abs(_axis_sum(K, 0) - 1).max() < tol):
             break
     return K
 
@@ -666,12 +796,7 @@ def _compute_bidir_corrs_all_cc(
     n_cc = A_all.shape[1]
 
     if normalize_K == "row_or_col":
-        rs = K.sum(axis=1, keepdims=True)
-        rs[rs < 1e-12] = 1.0
-        K_row = K / rs
-        cs = K.sum(axis=0, keepdims=True)
-        cs[cs < 1e-12] = 1.0
-        K_col = K / cs
+        K_row, K_col = _row_and_col_normalized(K)
         KA = K_row.T @ A_all
         KB = K_col @ B_all
     elif normalize_K == "sinkhorn_knopp":
@@ -688,3 +813,38 @@ def _compute_bidir_corrs_all_cc(
         cor2 = _safe_pearsonr(A_all[:, cc], KB[:, cc])
         corrs[cc] = (cor1 + cor2) / 2.0
     return corrs
+
+
+def _axis_sum(K, axis: int) -> np.ndarray:
+    return np.asarray(K.sum(axis=axis)).ravel()
+
+
+def _row_and_col_normalized(K):
+    """Return row- and column-normalized copies without densifying sparse K."""
+    rs = _axis_sum(K, 1)
+    rs[rs < 1e-12] = 1.0
+    cs = _axis_sum(K, 0)
+    cs[cs < 1e-12] = 1.0
+    if sparse.issparse(K):
+        return sparse.diags(1.0 / rs) @ K, K @ sparse.diags(1.0 / cs)
+    return K / rs[:, None], K / cs[None, :]
+
+
+def _filter_cross_kernel(K, A, B, row_cutoff, col_cutoff):
+    row_keep = _axis_sum(K, 1) > row_cutoff
+    if not np.any(row_keep):
+        return None
+    K_use = K[row_keep, :]
+    A_use = A[row_keep]
+    col_keep = _axis_sum(K_use, 0) > col_cutoff
+    if not np.any(col_keep):
+        return None
+    return K_use[:, col_keep], A_use, B[col_keep]
+
+
+def _filter_self_kernel(K, A, row_cutoff, col_cutoff):
+    keep = (_axis_sum(K, 1) > row_cutoff) & (_axis_sum(K, 0) > col_cutoff)
+    if not np.any(keep):
+        return None
+    K_use = K[keep, :][:, keep]
+    return K_use, A[keep]

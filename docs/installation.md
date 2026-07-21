@@ -6,6 +6,15 @@
 pip install pycopro
 ```
 
+Optional features can be installed with extras:
+
+```bash
+pip install "pycopro[stats,plot,data]"
+```
+
+These add `statsmodels` for gene-level tests, `matplotlib` for plotting, and
+`rdata` for loading example datasets.
+
 ## From source
 
 ```bash
@@ -21,6 +30,7 @@ pip install -e .
 - scipy ≥ 1.10
 - pandas ≥ 2.0
 - scikit-learn ≥ 1.3
+- anndata ≥ 0.10
 
 ## Verify installation
 

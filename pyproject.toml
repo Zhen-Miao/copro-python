@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycopro"
-version = "0.1.1"
+version = "0.2.0"
 description = "Spatial Kernel Restricted CCA for spatial transcriptomics"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,7 +39,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov"]
+stats = ["statsmodels>=0.14"]
+plot = ["matplotlib>=3.7"]
+data = ["rdata>=0.11"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "statsmodels>=0.14",
+    "matplotlib>=3.7",
+    "rdata>=0.11",
+]
 
 [project.urls]
 Homepage = "https://github.com/Zhen-Miao/copro-python"
@@ -49,3 +58,7 @@ Repository = "https://github.com/Zhen-Miao/copro-python"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["copro*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

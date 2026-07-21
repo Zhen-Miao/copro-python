@@ -237,42 +237,70 @@ def test_gene_scores(
 
     for ct in cts:
         results[ct] = {}
-        mask = obj.cell_types_sub == ct
 
-        # Expression for this cell type
-        X = obj.normalized_data_sub[mask].astype(float)
-
-        # Covariate dataframe
-        cov_df = None
+        # Validate covariate / group columns up-front (order-independent).
         if covariates:
             if meta_sub is None:
                 raise ValueError("No metadata available for covariates.")
             missing = [c for c in covariates if c not in meta_sub.columns]
             if missing:
                 raise ValueError(f"Covariates not found in metadata: {missing}")
-            cov_df = meta_sub.loc[mask, covariates].reset_index(drop=True)
-
-        # Group variable for LMM
-        group = None
         if test_type == "lmm":
             if meta_sub is None or group_var not in meta_sub.columns:
                 raise ValueError(
                     f"LMM requires '{group_var}' in metadata. "
                     f"Use test_type='glm' or provide a valid group_var."
                 )
-            group = meta_sub.loc[mask, group_var].values
+
+        # Build the design side (X, covariates, group).  For multi-slide objects
+        # this MUST be assembled per-slide in obj.slide_list order — the same order
+        # the response `cell_score` is concatenated below — so that every row of X
+        # aligns with its cell score.  Building X in whole-dataset cell order would
+        # misalign the response whenever a cell type's cells are not contiguous by
+        # slide (interleaved input, unsorted obs, or auto-sliced blocks).
+        if is_multi:
+            slide_ids = obj.meta_data_sub["slideID"].values
+            included_slides = []
+            X_parts = []
+            cov_parts = []
+            group_parts = []
+            for slide in obj.slide_list:
+                cs_key = f"cellScores|sigma{sigma}|{slide}|{ct}"
+                if cs_key not in obj.cell_scores:
+                    # Skip this slide on BOTH sides (design and cell_score) so the
+                    # two stay aligned.
+                    continue
+                mask_s = (obj.cell_types_sub == ct) & (slide_ids == slide)
+                included_slides.append(slide)
+                X_parts.append(obj.normalized_data_sub[mask_s].astype(float))
+                if covariates:
+                    cov_parts.append(meta_sub.loc[mask_s, covariates])
+                if test_type == "lmm":
+                    group_parts.append(meta_sub.loc[mask_s, group_var].values)
+
+            X = np.vstack(X_parts) if X_parts else None
+            cov_df = pd.concat(cov_parts, ignore_index=True) if cov_parts else None
+            group = np.concatenate(group_parts) if group_parts else None
+        else:
+            mask = obj.cell_types_sub == ct
+            X = obj.normalized_data_sub[mask].astype(float)
+            cov_df = None
+            if covariates:
+                cov_df = meta_sub.loc[mask, covariates].reset_index(drop=True)
+            group = None
+            if test_type == "lmm":
+                group = meta_sub.loc[mask, group_var].values
 
         for cc in range(n_cc):
             cc_name = f"CC_{cc + 1}"
 
             # Get cell scores for this ct + cc
             if is_multi:
-                # Aggregate across slides
-                cs_parts = []
-                for slide in obj.slide_list:
-                    cs_key = f"cellScores|sigma{sigma}|{slide}|{ct}"
-                    if cs_key in obj.cell_scores:
-                        cs_parts.append(obj.cell_scores[cs_key][:, cc])
+                # Aggregate across slides in the SAME slide order used to build X.
+                cs_parts = [
+                    obj.cell_scores[f"cellScores|sigma{sigma}|{slide}|{ct}"][:, cc]
+                    for slide in included_slides
+                ]
                 if not cs_parts:
                     if verbose:
                         print(f"  No cell scores for {ct} CC{cc+1}, skipping.")

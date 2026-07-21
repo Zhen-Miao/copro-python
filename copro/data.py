@@ -20,7 +20,8 @@ def copro_download_data(
     Parameters
     ----------
     dataset : str
-        One of ``"colon_d3"``, ``"colon_d9"``, ``"kidney"``,
+        One of ``"colon_d3"``, ``"colon_d0_multi"``,
+        ``"colon_d3_multi"``, ``"colon_d9"``, ``"kidney"``,
         ``"organoid"``, or ``"brain_merfish"``.
     destdir : str or None
         Directory to cache the downloaded file.  Defaults to
@@ -51,7 +52,10 @@ def copro_download_data(
             "Install with: pip install rdata"
         )
 
-    valid = {"colon_d3", "colon_d9", "kidney", "organoid", "brain_merfish"}
+    valid = {
+        "colon_d3", "colon_d0_multi", "colon_d3_multi", "colon_d9",
+        "kidney", "organoid", "brain_merfish",
+    }
     if dataset not in valid:
         raise ValueError(f"dataset must be one of {valid}, got '{dataset}'")
 

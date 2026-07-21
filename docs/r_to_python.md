@@ -11,6 +11,7 @@ Users familiar with the R package can use this as a migration guide.
 |---|--------|-------|
 | `newCoProSingle(normalizedData, locationData, metaData, cellTypes)` | `cp.CoProSingle(normalized_data, location_data, meta_data, cell_types)` | Arguments use `snake_case` in Python |
 | `newCoProMulti(...)` | `cp.CoProMulti(...)` | Requires `slideID` column in `meta_data` |
+| `asCoProSingle()` / `asCoProMulti()` | `cp.from_anndata(...)` | Extracts expression, `obs`, and `obsm["spatial"]` with row alignment preserved |
 
 ---
 
@@ -20,11 +21,19 @@ Users familiar with the R package can use this as a migration guide.
 |---|--------|----------------------|
 | `subsetData(obj, cellTypesOfInterest)` | `cp.subset_data(obj, cell_types_of_interest)` | |
 | `computePCA(obj, nPCA, center, scale.)` | `cp.compute_pca(obj, n_pca, center, scale)` | `scale.` → `scale` |
-| `computeDistance(obj, distType, normalizeDistance)` | `cp.compute_distance(obj, normalize)` | `distType` fixed to `"Euclidean2D"` |
-| `computeKernelMatrix(obj, sigmaValues, upperQuantile, lowerLimit)` | `cp.compute_kernel_matrix(obj, sigma_values, upper_quantile, lower_limit)` | |
+| `computeDistance(obj, distType, normalizeDistance)` | `cp.compute_distance(obj, dist_type, normalize)` | Euclidean 2D/3D and axis scales supported |
+| `computeKernelMatrix(..., method)` | `cp.compute_kernel_matrix(..., method)` | `auto`, `dense`, and exact `sparse` paths |
+| `computeSparseKernel(...)` | `cp.compute_sparse_kernel(...)` | Direct fixed-radius CSR construction |
 | `runSkrCCA(obj, scalePCs, nCC, maxIter, tol)` | `cp.run_skr_cca(obj, scale_pcs, n_cc, max_iter, tol)` | |
 | `computeNormalizedCorrelation(obj, tol)` | `cp.compute_normalized_correlation(obj, tol)` | |
 | `computeGeneAndCellScores(obj)` | `cp.compute_gene_and_cell_scores(obj)` | |
+| `runGeneSpaceCCA(...)` | `cp.run_gene_space_cca(...)` | Multi-slide, slot-based or streaming |
+| `runSkrCCAPermu()` | `cp.run_skr_cca_permu()` | Fixed-sigma compatibility path |
+| `runSkrCCAPermu_FairSigma()` | `cp.run_skr_cca_permu_fair_sigma()` | Max-over-sigma inference |
+| `runSkrCCAPermu_Conditional()` | `cp.run_skr_cca_permu_conditional()` | Sequential conditional axes |
+| `calculate_pvalue_stepdown()` | `cp.calculate_pvalue_stepdown()` | Closed step-down adjusted p-values |
+| `getTransferNormCorr(...)` | `cp.get_transfer_norm_corr(...)` | Multi-slide `calculation_mode="per_slide"` or `"aggregate"`; `sigma_choice_tar` selects the target kernel |
+| `getTransferBidirCorr(...)` | `cp.get_transfer_bidir_corr(...)` | Multi-slide `calculation_mode="per_slide"` or `"aggregate"`; `sigma_choice_tar` selects the target kernel |
 
 ---
 
@@ -127,10 +136,8 @@ KA_scores = K_AB.T @ scores_A       # AK column in R's output
 
 ---
 
-## Features not yet in Python
+## Remaining difference
 
 | R function | Status |
 |------------|--------|
-| `runSkrCCAPermu()` | Not yet implemented |
-| `computeNormalizedCorrelationPermu()` | Not yet implemented |
-| `distType = "Morphology-Aware"` | Not yet implemented (`"Euclidean2D"` only) |
+| `distType = "Morphology-Aware"` | Not yet implemented; use Euclidean 2D/3D |

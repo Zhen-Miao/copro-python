@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from itertools import combinations
+import warnings
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 from .core import CoProSingle, CoProMulti
-from .correlation import _spectral_norm, _get_kernel_for_pair
+from .correlation import (
+    _compute_bidir_corrs_all_cc,
+    _filter_cross_kernel,
+    _get_kernel_for_pair,
+    _kernel_normalizer,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +179,9 @@ def get_transfer_cell_scores(
     gs_weight_threshold : float
         Zero out gene weights with absolute value below this threshold.
     gene_score_type : str
-        ``"PCA"`` uses ``obj.gene_scores``; ``"regression"`` uses
-        ``obj.gene_scores_regression`` (must call
-        ``compute_regression_gene_scores`` first).
+        ``"PCA"`` uses PCA-backprojected scores, ``"gene_space"`` uses
+        weights stored directly by :func:`run_gene_space_cca`, and
+        ``"regression"`` uses ``obj.gene_scores_regression``.
     verbose : bool
         Print progress messages.
 
@@ -192,20 +199,23 @@ def get_transfer_cell_scores(
         raise TypeError("tar_obj must be a CoProSingle or CoProMulti.")
 
     # Select gene score source
-    if gene_score_type == "regression":
+    score_type = str(gene_score_type).lower().replace("-", "_")
+    if score_type == "regression":
         gs_all = getattr(ref_obj, "gene_scores_regression", {})
         if not gs_all:
             raise ValueError(
                 "gene_scores_regression not found. "
                 "Run compute_regression_gene_scores() on the reference first."
             )
-    else:
+    elif score_type in {"pca", "gene_space", "genespace", "gscca"}:
         gs_all = ref_obj.gene_scores
         if not gs_all:
             raise ValueError(
                 "gene_scores not found. "
                 "Run compute_gene_and_cell_scores() on the reference first."
             )
+    else:
+        raise ValueError("gene_score_type must be 'PCA', 'gene_space', or 'regression'.")
 
     cts = ref_obj.cell_types_of_interest
     cts_tar = tar_obj.cell_types_of_interest
@@ -214,24 +224,12 @@ def get_transfer_cell_scores(
             f"Cell types mismatch: ref={cts}, tar={cts_tar}."
         )
 
-    # Gene name intersection
+    # Full expression-space gene names. Gene-space CCA may have filtered its
+    # weights to a smaller explicitly named set, handled per cell type below.
     ref_genes = _get_gene_names(ref_obj)
     tar_genes = _get_gene_names(tar_obj)
-    if ref_genes is not None and tar_genes is not None:
-        if list(ref_genes) != list(tar_genes):
-            genes_sel = sorted(set(ref_genes) & set(tar_genes))
-            if len(genes_sel) == 0:
-                raise ValueError("No overlapping genes between reference and target.")
-            if verbose:
-                print(f"Gene name mismatch — using {len(genes_sel)} shared genes "
-                      f"(ref={len(ref_genes)}, tar={len(tar_genes)}).")
-            ref_idx = np.array([list(ref_genes).index(g) for g in genes_sel])
-            tar_idx = np.array([list(tar_genes).index(g) for g in genes_sel])
-        else:
-            ref_idx = tar_idx = None
-    else:
-        # No gene names — assume same ordering
-        ref_idx = tar_idx = None
+    ref_genes = None if ref_genes is None else list(ref_genes)
+    tar_genes = None if tar_genes is None else list(tar_genes)
 
     B_cs = {}
     for ct in cts:
@@ -249,12 +247,55 @@ def get_transfer_cell_scores(
         tar_mask = tar_obj.cell_types_sub == ct
         mat_A = ref_obj.normalized_data_sub[ref_mask].astype(float)
         mat_B = tar_obj.normalized_data_sub[tar_mask].astype(float)
+        if sparse.issparse(mat_A):
+            mat_A = mat_A.toarray()
+        if sparse.issparse(mat_B):
+            mat_B = mat_B.toarray()
 
-        # Subset to shared genes
-        if ref_idx is not None:
+        if ref_genes is not None and tar_genes is not None:
+            if gs_ct.shape[0] == len(ref_genes):
+                score_genes = ref_genes
+            else:
+                score_genes = list(getattr(ref_obj, "gene_space_genes", []))
+                if len(score_genes) != gs_ct.shape[0]:
+                    raise ValueError(
+                        f"Gene-score rows ({gs_ct.shape[0]}) cannot be aligned to "
+                        "the reference expression genes."
+                    )
+            tar_lookup = {gene: idx for idx, gene in enumerate(tar_genes)}
+            ref_lookup = {gene: idx for idx, gene in enumerate(ref_genes)}
+            shared = [
+                gene for gene in score_genes
+                if gene in ref_lookup and gene in tar_lookup
+            ]
+            if not shared:
+                raise ValueError("No overlapping genes between reference and target.")
+            score_lookup = {gene: idx for idx, gene in enumerate(score_genes)}
+            ref_idx = np.asarray([ref_lookup[gene] for gene in shared], dtype=int)
+            tar_idx = np.asarray([tar_lookup[gene] for gene in shared], dtype=int)
+            score_idx = np.asarray([score_lookup[gene] for gene in shared], dtype=int)
             mat_A = mat_A[:, ref_idx]
             mat_B = mat_B[:, tar_idx]
-            gs_ct = gs_ct[ref_idx]
+            gs_ct = gs_ct[score_idx]
+            if verbose and (
+                len(shared) != len(ref_genes) or ref_genes != tar_genes
+            ):
+                print(
+                    f"Gene alignment — using {len(shared)} shared genes "
+                    f"(ref={len(ref_genes)}, tar={len(tar_genes)})."
+                )
+        elif gs_ct.shape[0] != mat_A.shape[1]:
+            indices = getattr(ref_obj, "gene_space_gene_indices", None)
+            if indices is None or len(indices) != gs_ct.shape[0]:
+                raise ValueError(
+                    "Filtered gene-space weights require gene names or valid "
+                    "gene_space_gene_indices for score transfer."
+                )
+            indices = np.asarray(indices, dtype=int)
+            if indices.size and indices.max() >= mat_B.shape[1]:
+                raise ValueError("Target expression does not contain all filtered genes.")
+            mat_A = mat_A[:, indices]
+            mat_B = mat_B[:, indices]
 
         if verbose:
             print(f"Transferring scores for cell type '{ct}' "
@@ -290,6 +331,8 @@ def get_transfer_norm_corr(
     sigma_choice: float,
     tol: float = 1e-4,
     verbose: bool = True,
+    calculation_mode: str | None = None,
+    sigma_choice_tar: float | None = None,
 ) -> pd.DataFrame:
     """Compute normalized correlation from transferred cell scores.
 
@@ -301,76 +344,77 @@ def get_transfer_norm_corr(
         ``{cell_type: np.ndarray (n_cells, n_cc)}`` from
         ``get_transfer_cell_scores(agg_cell_type=False)``.
     sigma_choice : float
-        Sigma value for the target kernel.
+        Reference sigma used to label the transferred result.
     tol : float
-        SVD tolerance for spectral norm.
+        Retained for API compatibility; the current normalizer is exact.
     verbose : bool
         Print progress messages.
+    calculation_mode : str or None
+        For ``CoProMulti``, ``"per_slide"`` (default) or ``"aggregate"``.
+        The R spelling ``"perSlide"`` is also accepted. Ignored for single
+        slide targets.
+    sigma_choice_tar : float or None
+        Sigma used to select target kernels. Defaults to ``sigma_choice``.
 
     Returns
     -------
     pd.DataFrame
         Columns: sigma, cell_type_1, cell_type_2, CC_index,
-        normalized_correlation (and slideID for multi-slide).
+        Per-slide output contains ``normalized_correlation`` and ``slideID``.
+        Aggregate output contains ``aggregate_correlation``.
     """
-    if not isinstance(tar_obj, (CoProSingle, CoProMulti)):
-        raise TypeError("tar_obj must be a CoProSingle or CoProMulti.")
-    if not transfer_cell_scores:
-        raise ValueError("transfer_cell_scores must be a non-empty dict.")
+    cts, pairs, n_cc = _validate_transfer_correlation_inputs(
+        tar_obj, transfer_cell_scores, sigma_choice
+    )
+    target_sigma = _resolve_target_sigma(sigma_choice, sigma_choice_tar)
+    mode = _resolve_transfer_calculation_mode(tar_obj, calculation_mode)
 
-    cts = list(transfer_cell_scores.keys())
-    n_cc = transfer_cell_scores[cts[0]].shape[1]
-
-    # Pairs
-    if len(cts) == 1:
-        pairs = [(cts[0], cts[0])]
-    else:
-        pairs = list(combinations(cts, 2))
-
-    is_multi = isinstance(tar_obj, CoProMulti)
-
-    if not is_multi:
+    if isinstance(tar_obj, CoProSingle):
         return _transfer_norm_corr_single(
-            tar_obj, transfer_cell_scores, sigma_choice,
+            tar_obj, transfer_cell_scores, sigma_choice, target_sigma,
             cts, pairs, n_cc, tol, verbose,
         )
-    else:
-        return _transfer_norm_corr_multi(
-            tar_obj, transfer_cell_scores, sigma_choice,
-            cts, pairs, n_cc, tol, verbose,
-        )
+    return _transfer_norm_corr_multi(
+        tar_obj, transfer_cell_scores, sigma_choice, target_sigma,
+        cts, pairs, n_cc, tol, verbose, mode,
+    )
 
 
 def _transfer_norm_corr_single(
-    tar_obj, scores, sigma, cts, pairs, n_cc, tol, verbose,
+    tar_obj, scores, sigma, target_sigma, cts, pairs, n_cc, tol, verbose,
 ):
     """Single-slide transfer normalized correlation."""
-    # Precompute spectral norms
-    spec_norms = {}
+    del tol, verbose
+    # Precompute matched-sigma whitened-Frobenius normalizers.
+    kernel_norms = {}
     for ct_i, ct_j in pairs:
         try:
-            K = _get_kernel_for_pair(tar_obj.kernel_matrices, sigma, ct_i, ct_j)
-            spec_norms[(ct_i, ct_j)] = _spectral_norm(K, tol)
+            kernel_norms[(ct_i, ct_j)] = _kernel_normalizer(
+                tar_obj.kernel_matrices, target_sigma, ct_i, ct_j
+            )
         except KeyError:
-            spec_norms[(ct_i, ct_j)] = np.nan
+            kernel_norms[(ct_i, ct_j)] = np.nan
 
     rows = []
     for ct_i, ct_j in pairs:
         try:
-            K = _get_kernel_for_pair(tar_obj.kernel_matrices, sigma, ct_i, ct_j)
+            K = _get_kernel_for_pair(
+                tar_obj.kernel_matrices, target_sigma, ct_i, ct_j
+            )
         except KeyError:
             continue
-        norm_K = spec_norms.get((ct_i, ct_j), np.nan)
+        norm_K = kernel_norms.get((ct_i, ct_j), np.nan)
         if np.isnan(norm_K) or norm_K < 1e-9:
             continue
 
         A_scores = scores[ct_i]  # (n_A, n_cc)
         B_scores = scores[ct_j]  # (n_B, n_cc)
+        _validate_kernel_score_shapes(K, A_scores, B_scores, ct_i, ct_j)
 
         for cc in range(n_cc):
             A_w = A_scores[:, cc]
             B_w = B_scores[:, cc]
-            numerator = float(A_w @ K @ B_w)
+            numerator = float(A_w @ (K @ B_w))
             denom = float(np.linalg.norm(A_w) * np.linalg.norm(B_w) * norm_K)
             nc = 0.0 if abs(denom) < 1e-9 else numerator / denom
             rows.append({
@@ -381,75 +425,108 @@ def _transfer_norm_corr_single(
                 "normalized_correlation": nc,
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=[
+        "sigma", "cell_type_1", "cell_type_2", "CC_index",
+        "normalized_correlation",
+    ])
 
 
 def _transfer_norm_corr_multi(
-    tar_obj, scores, sigma, cts, pairs, n_cc, tol, verbose,
+    tar_obj, scores, sigma, target_sigma, cts, pairs, n_cc, tol, verbose,
+    calculation_mode,
 ):
     """Multi-slide transfer normalized correlation."""
-    slides = tar_obj.slide_list
+    del tol, verbose
+    slides = _target_slides(tar_obj)
 
-    # Precompute per-slide spectral norms
-    spec_norms = {}
+    # Precompute per-slide matched-sigma normalizers.
+    kernel_norms = {}
     for ct_i, ct_j in pairs:
         for slide in slides:
             try:
-                K = _get_kernel_for_pair(
-                    tar_obj.kernel_matrices, sigma, ct_i, ct_j, slide
+                kernel_norms[(ct_i, ct_j, slide)] = _kernel_normalizer(
+                    tar_obj.kernel_matrices, target_sigma, ct_i, ct_j, slide
                 )
-                spec_norms[(ct_i, ct_j, slide)] = _spectral_norm(K, tol)
             except KeyError:
-                spec_norms[(ct_i, ct_j, slide)] = np.nan
+                kernel_norms[(ct_i, ct_j, slide)] = np.nan
 
-    # Build cell-to-slide mapping from tar_obj
-    slide_ids = tar_obj.meta_data_sub["slideID"].values
+    if calculation_mode == "per_slide":
+        rows = []
+        for ct_i, ct_j in pairs:
+            for slide in slides:
+                norm_K = kernel_norms.get((ct_i, ct_j, slide), np.nan)
+                if not np.isfinite(norm_K) or norm_K < 1e-9:
+                    continue
+                inputs = _transfer_slide_inputs(
+                    tar_obj, scores, target_sigma, slide, ct_i, ct_j
+                )
+                if inputs is None:
+                    continue
+                K, A_scores, B_scores = inputs
+                for cc in range(n_cc):
+                    A_w = A_scores[:, cc]
+                    B_w = B_scores[:, cc]
+                    numerator = float(A_w @ (K @ B_w))
+                    denom = float(
+                        np.linalg.norm(A_w) * np.linalg.norm(B_w) * norm_K
+                    )
+                    value = 0.0 if abs(denom) < 1e-9 else numerator / denom
+                    rows.append({
+                        "sigma": sigma,
+                        "slideID": slide,
+                        "cell_type_1": ct_i,
+                        "cell_type_2": ct_j,
+                        "CC_index": cc + 1,
+                        "normalized_correlation": value,
+                    })
+        return pd.DataFrame(rows, columns=[
+            "sigma", "slideID", "cell_type_1", "cell_type_2", "CC_index",
+            "normalized_correlation",
+        ])
 
     rows = []
     for ct_i, ct_j in pairs:
-        for slide in slides:
-            norm_K = spec_norms.get((ct_i, ct_j, slide), np.nan)
-            if np.isnan(norm_K) or norm_K < 1e-9:
-                continue
-            try:
-                K = _get_kernel_for_pair(
-                    tar_obj.kernel_matrices, sigma, ct_i, ct_j, slide
+        for cc in range(n_cc):
+            total_numerator = 0.0
+            total_norm_i = 0.0
+            total_norm_j = 0.0
+            total_kernel_norm = 0.0
+            valid_slides = 0
+            for slide in slides:
+                norm_K = kernel_norms.get((ct_i, ct_j, slide), np.nan)
+                if not np.isfinite(norm_K) or norm_K < 1e-9:
+                    continue
+                inputs = _transfer_slide_inputs(
+                    tar_obj, scores, target_sigma, slide, ct_i, ct_j
                 )
-            except KeyError:
-                continue
-
-            # Get cells for this slide and type
-            mask_i = (tar_obj.cell_types_sub == ct_i) & (slide_ids == slide)
-            mask_j = (tar_obj.cell_types_sub == ct_j) & (slide_ids == slide)
-
-            # Indices within the cell-type subset
-            ct_i_mask = tar_obj.cell_types_sub == ct_i
-            ct_j_mask = tar_obj.cell_types_sub == ct_j
-            idx_i = np.where(mask_i[ct_i_mask])[0]
-            idx_j = np.where(mask_j[ct_j_mask])[0]
-
-            if len(idx_i) == 0 or len(idx_j) == 0:
-                continue
-
-            A_scores = scores[ct_i][idx_i]
-            B_scores = scores[ct_j][idx_j]
-
-            for cc in range(n_cc):
+                if inputs is None:
+                    continue
+                K, A_scores, B_scores = inputs
                 A_w = A_scores[:, cc]
                 B_w = B_scores[:, cc]
-                numerator = float(A_w @ K @ B_w)
-                denom = float(np.linalg.norm(A_w) * np.linalg.norm(B_w) * norm_K)
-                nc = 0.0 if abs(denom) < 1e-9 else numerator / denom
+                total_numerator += float(A_w @ (K @ B_w))
+                total_norm_i += float(np.sum(A_w**2))
+                total_norm_j += float(np.sum(B_w**2))
+                total_kernel_norm += float(norm_K)
+                valid_slides += 1
+            if valid_slides:
+                denom = (
+                    np.sqrt(total_norm_i)
+                    * np.sqrt(total_norm_j)
+                    * (total_kernel_norm / valid_slides)
+                )
+                value = 0.0 if abs(denom) < 1e-9 else total_numerator / denom
                 rows.append({
                     "sigma": sigma,
-                    "slideID": slide,
                     "cell_type_1": ct_i,
                     "cell_type_2": ct_j,
                     "CC_index": cc + 1,
-                    "normalized_correlation": nc,
+                    "aggregate_correlation": value,
                 })
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=[
+        "sigma", "cell_type_1", "cell_type_2", "CC_index",
+        "aggregate_correlation",
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +542,8 @@ def get_transfer_bidir_corr(
     K_row_sum_cutoff: float = 5e-3,
     K_col_sum_cutoff: float = 5e-3,
     verbose: bool = True,
+    calculation_mode: str | None = None,
+    sigma_choice_tar: float | None = None,
 ) -> pd.DataFrame:
     """Compute bidirectional correlation from transferred cell scores.
 
@@ -477,7 +556,7 @@ def get_transfer_bidir_corr(
     transfer_cell_scores : dict
         ``{cell_type: np.ndarray (n_cells, n_cc)}``.
     sigma_choice : float
-        Sigma value for the kernel.
+        Reference sigma used to label the transferred result.
     normalize_K : str
         Kernel normalization: ``"row_or_col"``, ``"sinkhorn_knopp"``, or
         ``"none"``.
@@ -489,125 +568,252 @@ def get_transfer_bidir_corr(
         Minimum column sum threshold.
     verbose : bool
         Print progress.
+    calculation_mode : str or None
+        For ``CoProMulti``, ``"per_slide"`` (default) or ``"aggregate"``.
+        The R spelling ``"perSlide"`` is also accepted.
+    sigma_choice_tar : float or None
+        Sigma used to select target kernels. Defaults to ``sigma_choice``.
 
     Returns
     -------
     pd.DataFrame
-        Columns: sigma, cell_type_1, cell_type_2, CC_index, bidir_correlation.
+        Per-slide output contains ``bidir_correlation`` and ``slideID``.
+        Aggregate output contains ``aggregate_correlation``.
     """
-    cts = list(transfer_cell_scores.keys())
-    n_cc = transfer_cell_scores[cts[0]].shape[1]
+    del verbose
+    if normalize_K not in {"row_or_col", "sinkhorn_knopp", "none"}:
+        raise ValueError(
+            "normalize_K must be 'row_or_col', 'sinkhorn_knopp', or 'none'."
+        )
+    cts, pairs, n_cc = _validate_transfer_correlation_inputs(
+        tar_obj, transfer_cell_scores, sigma_choice
+    )
+    target_sigma = _resolve_target_sigma(sigma_choice, sigma_choice_tar)
+    mode = _resolve_transfer_calculation_mode(tar_obj, calculation_mode)
 
-    if len(cts) == 1:
-        pairs = [(cts[0], cts[0])]
-    else:
-        pairs = list(combinations(cts, 2))
+    if isinstance(tar_obj, CoProSingle):
+        rows = []
+        for ct_i, ct_j in pairs:
+            try:
+                K = _get_kernel_for_pair(
+                    tar_obj.kernel_matrices, target_sigma, ct_i, ct_j
+                )
+            except KeyError:
+                continue
+            A_scores = transfer_cell_scores[ct_i]
+            B_scores = transfer_cell_scores[ct_j]
+            _validate_kernel_score_shapes(K, A_scores, B_scores, ct_i, ct_j)
+            corrs = _transfer_bidir_values(
+                K, A_scores, B_scores, normalize_K, filter_kernel,
+                K_row_sum_cutoff, K_col_sum_cutoff, ct_i, ct_j,
+            )
+            for cc, value in enumerate(corrs, start=1):
+                rows.append({
+                    "sigma": sigma_choice,
+                    "cell_type_1": ct_i,
+                    "cell_type_2": ct_j,
+                    "CC_index": cc,
+                    "bidir_correlation": value,
+                })
+        return pd.DataFrame(rows, columns=[
+            "sigma", "cell_type_1", "cell_type_2", "CC_index",
+            "bidir_correlation",
+        ])
+
+    slides = _target_slides(tar_obj)
+    if mode == "per_slide":
+        rows = []
+        for slide in slides:
+            for ct_i, ct_j in pairs:
+                inputs = _transfer_slide_inputs(
+                    tar_obj, transfer_cell_scores, target_sigma,
+                    slide, ct_i, ct_j,
+                )
+                if inputs is None:
+                    continue
+                K, A_scores, B_scores = inputs
+                corrs = _transfer_bidir_values(
+                    K, A_scores, B_scores, normalize_K, filter_kernel,
+                    K_row_sum_cutoff, K_col_sum_cutoff, ct_i, ct_j,
+                )
+                for cc, value in enumerate(corrs, start=1):
+                    rows.append({
+                        "sigma": sigma_choice,
+                        "slideID": slide,
+                        "cell_type_1": ct_i,
+                        "cell_type_2": ct_j,
+                        "CC_index": cc,
+                        "bidir_correlation": value,
+                    })
+        return pd.DataFrame(rows, columns=[
+            "sigma", "slideID", "cell_type_1", "cell_type_2", "CC_index",
+            "bidir_correlation",
+        ])
 
     rows = []
     for ct_i, ct_j in pairs:
-        try:
-            K = _get_kernel_for_pair(
-                tar_obj.kernel_matrices, sigma_choice, ct_i, ct_j
+        correlation_sum = np.zeros(n_cc, dtype=float)
+        valid_slides = np.zeros(n_cc, dtype=int)
+        for slide in slides:
+            inputs = _transfer_slide_inputs(
+                tar_obj, transfer_cell_scores, target_sigma,
+                slide, ct_i, ct_j,
             )
-        except KeyError:
-            continue
-
-        A_all = transfer_cell_scores[ct_i]  # (n_A, n_cc)
-        B_all = transfer_cell_scores[ct_j]  # (n_B, n_cc)
-
-        # Filter kernel
-        if filter_kernel:
-            row_keep = K.sum(axis=1) > K_row_sum_cutoff
-            K = K[row_keep]
-            A_all = A_all[row_keep]
-            col_keep = K.sum(axis=0) > K_col_sum_cutoff
-            K = K[:, col_keep]
-            B_all = B_all[col_keep]
-
-        corrs = _compute_bidir_correlations(A_all, B_all, K, normalize_K)
-
+            if inputs is None:
+                continue
+            K, A_scores, B_scores = inputs
+            corrs = _transfer_bidir_values(
+                K, A_scores, B_scores, normalize_K, filter_kernel,
+                K_row_sum_cutoff, K_col_sum_cutoff, ct_i, ct_j,
+            )
+            finite = np.isfinite(corrs)
+            correlation_sum[finite] += corrs[finite]
+            valid_slides[finite] += 1
         for cc in range(n_cc):
-            rows.append({
-                "sigma": sigma_choice,
-                "cell_type_1": ct_i,
-                "cell_type_2": ct_j,
-                "CC_index": cc + 1,
-                "bidir_correlation": corrs[cc],
-            })
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _compute_bidir_correlations(
-    A_all: np.ndarray,
-    B_all: np.ndarray,
-    K: np.ndarray,
-    normalize_K: str,
-) -> np.ndarray:
-    """Compute bidirectional correlations for all CCs.
-
-    Returns array of length n_cc.
-    """
-    n_cc = A_all.shape[1]
-
-    if normalize_K == "row_or_col":
-        rs = K.sum(axis=1, keepdims=True)
-        rs[rs < 1e-12] = 1.0
-        K_row = K / rs
-        cs = K.sum(axis=0, keepdims=True)
-        cs[cs < 1e-12] = 1.0
-        K_col = K / cs
-        KA = K_row.T @ A_all     # (n_B, n_cc)
-        KB = K_col @ B_all       # (n_A, n_cc)
-    elif normalize_K == "sinkhorn_knopp":
-        K_norm = _sinkhorn_knopp(K)
-        KA = K_norm.T @ A_all
-        KB = K_norm @ B_all
-    else:  # "none"
-        KA = K.T @ A_all
-        KB = K @ B_all
-
-    corrs = np.zeros(n_cc)
-    for cc in range(n_cc):
-        cor1 = _safe_pearsonr(KA[:, cc], B_all[:, cc])
-        cor2 = _safe_pearsonr(A_all[:, cc], KB[:, cc])
-        corrs[cc] = (cor1 + cor2) / 2.0
-
-    return corrs
+            if valid_slides[cc]:
+                rows.append({
+                    "sigma": sigma_choice,
+                    "cell_type_1": ct_i,
+                    "cell_type_2": ct_j,
+                    "CC_index": cc + 1,
+                    "aggregate_correlation": (
+                        correlation_sum[cc] / valid_slides[cc]
+                    ),
+                })
+    return pd.DataFrame(rows, columns=[
+        "sigma", "cell_type_1", "cell_type_2", "CC_index",
+        "aggregate_correlation",
+    ])
 
 
-def _safe_pearsonr(x: np.ndarray, y: np.ndarray) -> float:
-    """Pearson correlation, returning 0.0 if either vector has zero variance."""
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = np.sqrt(np.sum(x**2) * np.sum(y**2))
-    if denom < 1e-12:
-        return 0.0
-    return float(np.sum(x * y) / denom)
+def _validate_transfer_correlation_inputs(
+    tar_obj, transfer_cell_scores, sigma_choice,
+):
+    """Validate shared transfer-correlation inputs and infer pairs/CC count."""
+    if not isinstance(tar_obj, (CoProSingle, CoProMulti)):
+        raise TypeError("tar_obj must be a CoProSingle or CoProMulti.")
+    if not isinstance(transfer_cell_scores, dict) or not transfer_cell_scores:
+        raise ValueError("transfer_cell_scores must be a non-empty dict.")
+    if not _is_positive_numeric_scalar(sigma_choice):
+        raise ValueError("sigma_choice must be a positive numeric scalar.")
+
+    cts = list(transfer_cell_scores)
+    n_cc = None
+    for ct in cts:
+        matrix = transfer_cell_scores[ct]
+        if not isinstance(matrix, np.ndarray) or matrix.ndim != 2:
+            raise ValueError(f"transfer_cell_scores[{ct!r}] must be a 2-D ndarray.")
+        if n_cc is None:
+            n_cc = matrix.shape[1]
+        elif matrix.shape[1] != n_cc:
+            raise ValueError("All transferred score matrices need the same CC count.")
+        expected_rows = int(np.sum(np.asarray(tar_obj.cell_types_sub) == ct))
+        if matrix.shape[0] != expected_rows:
+            raise ValueError(
+                f"Transferred scores for {ct!r} have {matrix.shape[0]} rows; "
+                f"expected {expected_rows}."
+            )
+    if n_cc is None or n_cc < 1:
+        raise ValueError("Transferred score matrices must have at least one CC.")
+    pairs = [(cts[0], cts[0])] if len(cts) == 1 else list(combinations(cts, 2))
+    return cts, pairs, n_cc
 
 
-def _sinkhorn_knopp(
-    K: np.ndarray, max_iter: int = 100, tol: float = 1e-6,
-) -> np.ndarray:
-    """Sinkhorn-Knopp doubly-stochastic normalization."""
-    K = K.copy().astype(float)
-    K[K < 0] = 0.0
-    for _ in range(max_iter):
-        rs = K.sum(axis=1, keepdims=True)
-        rs[rs < 1e-12] = 1.0
-        K = K / rs
-        cs = K.sum(axis=0, keepdims=True)
-        cs[cs < 1e-12] = 1.0
-        K = K / cs
-        # Check convergence
-        if (np.abs(K.sum(axis=1) - 1).max() < tol and
-                np.abs(K.sum(axis=0) - 1).max() < tol):
-            break
-    return K
+def _resolve_target_sigma(sigma_choice, sigma_choice_tar):
+    if sigma_choice_tar is None:
+        return sigma_choice
+    if not _is_positive_numeric_scalar(sigma_choice_tar):
+        raise ValueError("sigma_choice_tar must be a positive numeric scalar.")
+    warnings.warn(
+        "Using different sigma values for reference and target objects is not "
+        "recommended and is intended for development use only."
+    )
+    return sigma_choice_tar
+
+
+def _is_positive_numeric_scalar(value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        return False
+    numeric = float(value)
+    return np.isfinite(numeric) and numeric > 0
+
+
+def _resolve_transfer_calculation_mode(tar_obj, calculation_mode):
+    if isinstance(tar_obj, CoProSingle):
+        return "single"
+    if calculation_mode is None:
+        return "per_slide"
+    normalized = str(calculation_mode).replace("-", "_").lower()
+    if normalized in {"perslide", "per_slide"}:
+        return "per_slide"
+    if normalized == "aggregate":
+        return "aggregate"
+    raise ValueError(
+        "calculation_mode must be 'per_slide' (or 'perSlide') or 'aggregate'."
+    )
+
+
+def _target_slides(tar_obj):
+    slides = list(getattr(tar_obj, "slide_list", []))
+    if not slides:
+        slides = sorted(tar_obj.meta_data_sub["slideID"].unique().tolist())
+    return slides
+
+
+def _score_indices_for_slide(tar_obj, cell_type, slide):
+    cell_types = np.asarray(tar_obj.cell_types_sub)
+    slide_ids = tar_obj.meta_data_sub["slideID"].to_numpy()
+    type_mask = cell_types == cell_type
+    return np.flatnonzero(slide_ids[type_mask] == slide)
+
+
+def _validate_kernel_score_shapes(K, A_scores, B_scores, ct_i, ct_j):
+    if K.shape != (A_scores.shape[0], B_scores.shape[0]):
+        raise ValueError(
+            f"Kernel shape {K.shape} does not match transferred scores for "
+            f"{ct_i}-{ct_j}: {(A_scores.shape[0], B_scores.shape[0])}."
+        )
+
+
+def _transfer_slide_inputs(
+    tar_obj, scores, target_sigma, slide, ct_i, ct_j,
+):
+    try:
+        K = _get_kernel_for_pair(
+            tar_obj.kernel_matrices, target_sigma, ct_i, ct_j, slide
+        )
+    except KeyError:
+        return None
+    idx_i = _score_indices_for_slide(tar_obj, ct_i, slide)
+    idx_j = _score_indices_for_slide(tar_obj, ct_j, slide)
+    if len(idx_i) == 0 or len(idx_j) == 0:
+        return None
+    A_scores = scores[ct_i][idx_i]
+    B_scores = scores[ct_j][idx_j]
+    _validate_kernel_score_shapes(K, A_scores, B_scores, ct_i, ct_j)
+    return K, A_scores, B_scores
+
+
+def _transfer_bidir_values(
+    K, A_scores, B_scores, normalize_K, filter_kernel,
+    row_cutoff, col_cutoff, ct_i, ct_j,
+):
+    if filter_kernel:
+        filtered = _filter_cross_kernel(
+            K, A_scores, B_scores, row_cutoff, col_cutoff
+        )
+    else:
+        filtered = (K, A_scores, B_scores)
+    if filtered is None:
+        warnings.warn(
+            f"Kernel filtering removed all cells for {ct_i}-{ct_j}; "
+            "returning zero bidirectional correlation."
+        )
+        return np.zeros(A_scores.shape[1], dtype=float)
+    K_use, A_use, B_use = filtered
+    return _compute_bidir_corrs_all_cc(A_use, B_use, K_use, normalize_K)
 
 
 def _get_gene_names(obj) -> list | None:

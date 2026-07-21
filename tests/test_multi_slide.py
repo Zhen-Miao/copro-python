@@ -20,6 +20,11 @@ EXPR_FILE = DATA_DIR / "alternative_round1_expression.parquet"
 META_FILE = DATA_DIR / "alternative_round1_metadata.parquet"
 REF_DIR = Path(__file__).parent / "r_reference" / "alt_round1_multi"
 
+pytestmark = pytest.mark.skipif(
+    not (EXPR_FILE.exists() and META_FILE.exists()),
+    reason="optional spatial-simulation integration dataset is unavailable",
+)
+
 SIGMA_VALUES = [0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.5]
 CELL_TYPES = ["A", "B"]
 N_PCA = 25
@@ -59,7 +64,12 @@ def copro_obj():
     obj = cp.subset_data(obj, CELL_TYPES)
     obj = cp.compute_pca(obj, n_pca=N_PCA)
     obj = cp.compute_distance(obj, normalize=False)
-    obj = cp.compute_kernel_matrix(obj, sigma_values=SIGMA_VALUES, row_normalize_kernel=True)
+    obj = cp.compute_kernel_matrix(
+        obj,
+        sigma_values=SIGMA_VALUES,
+        row_normalize_kernel=True,
+        drop_distances=False,
+    )
     obj = cp.run_skr_cca(obj, scale_pcs=True, n_cc=2, max_iter=500)
     obj = cp.compute_normalized_correlation(obj)
     obj = cp.compute_gene_and_cell_scores(obj)
