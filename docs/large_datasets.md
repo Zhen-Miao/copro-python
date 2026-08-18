@@ -5,6 +5,20 @@ matrix. Subset to the cell types of interest first, keep imaging-panel PCA
 small (typically 10–15 components), and build sparse kernels directly from
 coordinates.
 
+## Keep the expression matrix sparse
+
+Pass `normalized_data` as a SciPy sparse matrix (or an AnnData whose `X` is
+sparse) and `compute_pca()` will never densify it. Centering would destroy
+sparsity, so the standardized matrix is applied as a matrix-free operator and
+the truncated SVD only ever asks for products with it — the same technique R
+CoPro uses via `irlba`'s `center`/`scale.` arguments. Results are identical to
+the dense path to machine precision, including the component sign convention.
+
+On a 60,000-cell × 3,000-gene block at 8% density, `compute_pca(n_pca=30)`
+drops from 5.4 GB peak RSS / 47 s to 1.1 GB / 12 s. The saving grows with the
+block size, and even for a fairly dense block (~34% non-zero) peak memory is
+still roughly halved at comparable runtime.
+
 ```python
 import copro as cp
 

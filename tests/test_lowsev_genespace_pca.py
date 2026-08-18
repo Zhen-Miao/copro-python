@@ -139,9 +139,12 @@ def _scale_only_pca_dataset(seed=3, n_cells=300, n_genes=8):
     (std < 1e-3) | (nonzero_proportion < 0.01) safeguard."""
     rng = np.random.default_rng(seed)
     X = np.abs(rng.normal(size=(n_cells, n_genes))) + 1.0
-    # Near-constant gene: std ~1e-4 (between 1e-10 and 1e-3), all non-zero.
-    X[:, n_genes - 2] = 5.0 + 1e-4 * rng.normal(size=n_cells)
-    # Very-sparse gene: std >> 1e-3 but non-zero proportion < 0.01.
+    # Near-constant gene: scale ~1e-4 (between 1e-10 and 1e-3), all non-zero.
+    # It is centered on zero because scale-only PCA divides by the *uncentered*
+    # root mean square (R's scale(center = FALSE, scale = TRUE) and
+    # .sparse_pca_parameters()), so that is the quantity the guard tests.
+    X[:, n_genes - 2] = 1e-4 * rng.normal(size=n_cells)
+    # Very-sparse gene: scale >> 1e-3 but non-zero proportion < 0.01.
     X[:, n_genes - 1] = 0.0
     X[[10, 200], n_genes - 1] = 10.0
     return X
@@ -154,11 +157,11 @@ def test_scale_only_pca_matches_single_and_multi_slide():
     n_cells, n_genes = X.shape
 
     # Sanity: the two special genes actually trigger the two guard branches.
-    near_constant_std = X[:, n_genes - 2].std(ddof=1)
-    sparse_std = X[:, n_genes - 1].std(ddof=1)
+    # center=False, so the scale factor is the uncentered root mean square.
+    rms = np.sqrt((X ** 2).sum(axis=0) / (n_cells - 1))
     sparse_nz = np.mean(X[:, n_genes - 1] != 0)
-    assert 1e-10 < near_constant_std < 1e-3
-    assert sparse_std > 1e-3 and sparse_nz < 0.01
+    assert 1e-10 < rms[n_genes - 2] < 1e-3
+    assert rms[n_genes - 1] > 1e-3 and sparse_nz < 0.01
 
     loc = pd.DataFrame({
         "x": np.linspace(0, 1, n_cells),
