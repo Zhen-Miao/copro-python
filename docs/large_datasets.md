@@ -5,6 +5,49 @@ matrix. Subset to the cell types of interest first, keep imaging-panel PCA
 small (typically 10–15 components), and build sparse kernels directly from
 coordinates.
 
+## Keep the expression matrix sparse
+
+Pass `normalized_data` as a SciPy sparse matrix (or an AnnData whose `X` is
+sparse) and `compute_pca()` will never densify it. Centering would destroy
+sparsity, so the standardized matrix is applied as a matrix-free operator and
+the truncated SVD only ever asks for products with it — the same technique R
+CoPro uses via `irlba`'s `center`/`scale.` arguments. Results are identical to
+the dense path to machine precision, including the component sign convention.
+
+On a 60,000-cell × 3,000-gene block at 8% density, `compute_pca(n_pca=30)`
+drops from 5.4 GB peak RSS / 47 s to 1.1 GB / 12 s. The saving grows with the
+block size, and even for a fairly dense block (~34% non-zero) peak memory is
+still roughly halved at comparable runtime.
+
+## Multi-slide: within-slide standardization
+
+For `CoProMulti`, `compute_pca()` defaults to `center_per_slide=True`, matching
+R CoPro. Each (slide, cell type) block is standardized against its own gene
+means and scales *before* the single shared SVD, so a per-slide shift cannot
+drive the shared loadings. Per-slide scores are then rows of the one global
+score matrix — no separate projection step.
+
+This path is matrix-free too, so sparse input stays sparse here as well.
+
+A gene is left unscaled on every slide as soon as it is degenerate on any one
+of them. Scaling it on some slides and not others would put a per-slide scale
+difference back into exactly the low-detection genes whose detection rate is
+itself often the batch effect.
+
+Because the per-slide scales differ, the shared loading lives in
+within-slide-standardized gene coordinates: there is no single raw-unit
+back-projection. `pca_global[ct]` records `preprocessing`, `slide_centers`, and
+`slide_scales` so the affine map is recoverable.
+
+Pass `center_per_slide=False` for the older pooled behaviour — fit on all cells
+of the type at once, then project each slide. That mode stores `col_means` and
+`col_stds` instead.
+
+```python
+obj = cp.compute_pca(obj, n_pca=30)                        # within-slide (default)
+obj = cp.compute_pca(obj, n_pca=30, center_per_slide=False)  # pooled
+```
+
 ```python
 import copro as cp
 
