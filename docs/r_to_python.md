@@ -20,7 +20,7 @@ Users familiar with the R package can use this as a migration guide.
 | R | Python | Key argument changes |
 |---|--------|----------------------|
 | `subsetData(obj, cellTypesOfInterest)` | `cp.subset_data(obj, cell_types_of_interest)` | |
-| `computePCA(obj, nPCA, center, scale.)` | `cp.compute_pca(obj, n_pca, center, scale)` | `scale.` → `scale` |
+| `computePCA(obj, nPCA, center, scale., center_per_slide)` | `cp.compute_pca(obj, n_pca, center, scale, center_per_slide)` | `scale.` → `scale`; `center_per_slide=True` by default in both |
 | `computeDistance(obj, distType, normalizeDistance)` | `cp.compute_distance(obj, dist_type, normalize)` | Euclidean 2D/3D and axis scales supported |
 | `computeKernelMatrix(..., method)` | `cp.compute_kernel_matrix(..., method)` | `auto`, `dense`, and exact `sparse` paths |
 | `computeSparseKernel(...)` | `cp.compute_sparse_kernel(...)` | Direct fixed-radius CSR construction |

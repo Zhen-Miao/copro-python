@@ -79,7 +79,7 @@ CoPro runs a seven-step pipeline:
 | Step | Function | Description |
 |------|----------|-------------|
 | 1 | `subset_data` | Filter to cell types of interest |
-| 2 | `compute_pca` | Truncated PCA per cell type (ARPACK, matching R IRLBA) |
+| 2 | `compute_pca` | Truncated PCA per cell type (ARPACK, matching R IRLBA); sparse input stays sparse |
 | 3 | `compute_distance` | Pairwise Euclidean distances (within and between types) |
 | 4 | `compute_kernel_matrix` | Dense, sparse, or automatic Gaussian RBF kernels |
 | 5 | `run_skr_cca` | Exact two-type SVD or multi-set optimization over σ values |
@@ -119,7 +119,7 @@ Multi-slide variant. Requires a `slideID` column in `meta_data`.
 
 ```python
 cp.subset_data(obj, cell_types_of_interest)
-cp.compute_pca(obj, n_pca=30, center=True, scale=True)
+cp.compute_pca(obj, n_pca=30, center=True, scale=True, center_per_slide=True)
 cp.compute_distance(obj, normalize=False)
 cp.compute_kernel_matrix(obj, sigma_values, upper_quantile=0.85, lower_limit=5e-7)
 cp.run_skr_cca(obj, scale_pcs=True, n_cc=2, max_iter=500, tol=1e-5)

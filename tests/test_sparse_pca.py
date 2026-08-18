@@ -12,12 +12,17 @@ import numpy as np
 import pandas as pd
 import pytest
 from scipy import sparse
+from scipy.sparse._compressed import _cs_matrix
 
 from copro.core import CoProMulti, CoProSingle, subset_data
 from copro.pca import compute_pca
 
 
 N_CELLS, N_GENES, N_PCA = 240, 20, 5
+
+# compute_pca() accepts any of these unchanged (_as_svd_ready_sparse only
+# converts formats outside csr/csc), so each needs its own coverage.
+SPARSE_FORMATS = (sparse.csr_matrix, sparse.csc_matrix, sparse.csr_array)
 
 
 def _counts(seed: int = 0):
@@ -81,25 +86,42 @@ def _assert_pca_equal(dense_pca, sparse_pca):
     )
 
 
+@pytest.mark.parametrize("fmt", SPARSE_FORMATS)
 @pytest.mark.parametrize("center,scale", [(True, True), (True, False), (False, True), (False, False)])
-def test_single_slide_sparse_matches_dense(center, scale):
+def test_single_slide_sparse_matches_dense(center, scale, fmt):
     X = _counts()
     dense = compute_pca(_single(X.copy()), n_pca=N_PCA, center=center, scale=scale)
-    spars = compute_pca(_single(sparse.csr_matrix(X)), n_pca=N_PCA, center=center, scale=scale)
+    spars = compute_pca(_single(fmt(X)), n_pca=N_PCA, center=center, scale=scale)
     for ct in ("A", "B"):
         _assert_pca_equal(dense.pca_global[ct], spars.pca_global[ct])
 
 
+# Standardization arrays stored per preprocessing mode, and the tolerance used
+# to compare them. The dense path computes the variance two-pass and the sparse
+# path one-pass (mirroring R), so these agree only as well as that formula pair
+# does: ~1e-14 relative here because _counts() keeps gene means below ~1, but
+# the gap grows as (mean/sd)^2 and would exceed rtol=1e-9 for a gene with, say,
+# mean 1e3 and sd 1e-2. Keep the fixture's means small.
+_STANDARDIZATION_KEYS = {
+    "within_slide": ("slide_centers", "slide_scales"),
+    "pooled": ("col_means", "col_stds"),
+}
+
+
+@pytest.mark.parametrize("center_per_slide", [True, False])
 @pytest.mark.parametrize("center,scale", [(True, True), (True, False), (False, True), (False, False)])
-def test_multi_slide_sparse_matches_dense(center, scale):
+def test_multi_slide_sparse_matches_dense(center, scale, center_per_slide):
     X = _counts()
-    dense = compute_pca(_multi(X.copy()), n_pca=N_PCA, center=center, scale=scale)
-    spars = compute_pca(_multi(sparse.csr_matrix(X)), n_pca=N_PCA, center=center, scale=scale)
+    kwargs = dict(n_pca=N_PCA, center=center, scale=scale, center_per_slide=center_per_slide)
+    dense = compute_pca(_multi(X.copy()), **kwargs)
+    spars = compute_pca(_multi(sparse.csr_matrix(X)), **kwargs)
+    mode = "within_slide" if center_per_slide else "pooled"
     for ct in ("A", "B"):
         d, s = dense.pca_global[ct], spars.pca_global[ct]
+        assert d["preprocessing"] == s["preprocessing"] == mode
         _assert_pca_equal(d, s)
-        np.testing.assert_allclose(d["col_means"], s["col_means"], rtol=1e-9, atol=1e-12)
-        np.testing.assert_allclose(d["col_stds"], s["col_stds"], rtol=1e-9, atol=1e-12)
+        for key in _STANDARDIZATION_KEYS[mode]:
+            np.testing.assert_allclose(d[key], s[key], rtol=1e-9, atol=1e-12)
         signs = np.sign(np.sum(d["components"] * s["components"], axis=1))
         for slide in dense.slide_list:
             np.testing.assert_allclose(
@@ -109,24 +131,105 @@ def test_multi_slide_sparse_matches_dense(center, scale):
             )
 
 
-def test_sparse_input_is_never_densified(monkeypatch):
-    """Guard against a regression that reintroduces a dense cells-by-genes copy."""
-    X = sparse.csr_matrix(_counts())
+@pytest.mark.parametrize("center,scale", [(True, True), (False, True)])
+def test_within_slide_blocks_are_standardized_per_slide(center, scale):
+    """Each slide's block must be centered/scaled against its own statistics."""
+    X = _counts()
+    obj = compute_pca(_multi(sparse.csr_matrix(X)), n_pca=N_PCA,
+                      center=center, scale=scale, center_per_slide=True)
+    for ct in ("A", "B"):
+        pca = obj.pca_global[ct]
+        centers, scales = pca["slide_centers"], pca["slide_scales"]
+        assert centers.shape == scales.shape == (len(obj.slide_list), X.shape[1])
+        if not center:
+            assert np.all(centers == 0.0)
+        # A gene guarded on any one slide is guarded on all of them.
+        guarded = (scales == 1.0).any(axis=0)
+        assert np.array_equal(scales[:, guarded], np.ones_like(scales[:, guarded]))
+    # Per-slide scores are rows of the global score matrix, so stacking the
+    # per-slide blocks back together must reproduce it exactly.
+    for ct in ("A", "B"):
+        stacked = np.vstack([obj.pca_results[s][ct] for s in obj.slide_list])
+        assert stacked.shape == obj.pca_global[ct]["scores"].shape
+
+
+def test_within_slide_is_the_default():
+    X = _counts()
+    obj = compute_pca(_multi(sparse.csr_matrix(X)), n_pca=N_PCA)
+    assert obj.pca_global["A"]["preprocessing"] == "within_slide"
+
+
+def test_within_slide_removes_a_pure_slide_offset():
+    """A constant per-slide shift is batch effect, not signal: within-slide
+    preprocessing must absorb it, while the pooled path does not."""
+    X = _counts()
+    obj_plain = _multi(X.copy())
+    shifted = X.copy()
+    # slide "s2" is every odd row (see _multi); add a fixed offset to it.
+    shifted[1::2, 2:] += 3.0
+
+    within = compute_pca(_multi(shifted.copy()), n_pca=N_PCA, center_per_slide=True)
+    pooled = compute_pca(_multi(shifted.copy()), n_pca=N_PCA, center_per_slide=False)
+    baseline = compute_pca(obj_plain, n_pca=N_PCA, center_per_slide=True)
+
+    for ct in ("A", "B"):
+        # Within-slide standardization is invariant to the offset.
+        np.testing.assert_allclose(
+            within.pca_global[ct]["sdev"], baseline.pca_global[ct]["sdev"],
+            rtol=1e-6, atol=1e-8,
+        )
+        # The pooled path lets the offset dominate the leading component.
+        assert pooled.pca_global[ct]["sdev"][0] > 2 * within.pca_global[ct]["sdev"][0]
+
+
+@pytest.mark.parametrize("fmt", SPARSE_FORMATS)
+def test_sparse_input_is_never_densified(monkeypatch, fmt):
+    """Guard against a regression that reintroduces a dense cells-by-genes copy.
+
+    Patch ``_cs_matrix``, not ``csr_matrix``: ``toarray``/``todense`` are defined
+    on that shared base, so patching the leaf class shadows them for csr_matrix
+    only and leaves csc_matrix / csr_array able to densify undetected.
+    """
+    X = fmt(_counts())
 
     def _fail(self, *args, **kwargs):
         raise AssertionError("sparse PCA input was densified")
 
-    monkeypatch.setattr(sparse.csr_matrix, "toarray", _fail, raising=True)
-    monkeypatch.setattr(sparse.csr_matrix, "todense", _fail, raising=True)
+    monkeypatch.setattr(_cs_matrix, "toarray", _fail, raising=True)
+    monkeypatch.setattr(_cs_matrix, "todense", _fail, raising=True)
     compute_pca(_single(X), n_pca=N_PCA)
     compute_pca(_multi(X), n_pca=N_PCA)
 
 
-def test_guarded_genes_are_left_unscaled():
-    """Zero-variance and very-sparse genes keep a scale factor of 1 on the
-    sparse path, matching R's .sparse_pca_parameters()."""
+def test_densification_guard_covers_every_supported_format():
+    """The guard above is only meaningful if it actually trips on each format."""
+    def _fail(self, *args, **kwargs):
+        raise AssertionError("densified")
+
+    original = _cs_matrix.toarray
+    _cs_matrix.toarray = _fail
+    try:
+        for fmt in SPARSE_FORMATS:
+            with pytest.raises(AssertionError, match="densified"):
+                fmt(_counts()).toarray()
+    finally:
+        _cs_matrix.toarray = original
+
+
+@pytest.mark.parametrize("center_per_slide", [True, False])
+@pytest.mark.parametrize("as_sparse", [True, False])
+def test_guarded_genes_are_left_unscaled(center_per_slide, as_sparse):
+    """Zero-variance and very-sparse genes keep a scale factor of 1.
+
+    Matches R's .sparse_pca_parameters() / .withinSlidePCAParameters(), which
+    apply this guard on both the sparse and the dense path.
+    """
     X = _counts()
-    obj = compute_pca(_multi(sparse.csr_matrix(X)), n_pca=N_PCA)
-    col_stds = obj.pca_global["A"]["col_stds"]
-    assert col_stds[0] == 1.0   # all-zero gene
-    assert col_stds[1] == 1.0   # non-zero proportion < 1%
+    obj = compute_pca(_multi(sparse.csr_matrix(X) if as_sparse else X),
+                      n_pca=N_PCA, center_per_slide=center_per_slide)
+    for ct in ("A", "B"):
+        pca = obj.pca_global[ct]
+        scales = pca["slide_scales"] if center_per_slide else pca["col_stds"][None, :]
+        assert np.all(scales[:, 0] == 1.0)   # all-zero gene
+        assert np.all(scales[:, 1] == 1.0)   # non-zero proportion < 1%
+        assert np.all(scales > 0)            # nothing is ever divided by zero

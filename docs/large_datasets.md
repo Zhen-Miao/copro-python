@@ -19,6 +19,35 @@ drops from 5.4 GB peak RSS / 47 s to 1.1 GB / 12 s. The saving grows with the
 block size, and even for a fairly dense block (~34% non-zero) peak memory is
 still roughly halved at comparable runtime.
 
+## Multi-slide: within-slide standardization
+
+For `CoProMulti`, `compute_pca()` defaults to `center_per_slide=True`, matching
+R CoPro. Each (slide, cell type) block is standardized against its own gene
+means and scales *before* the single shared SVD, so a per-slide shift cannot
+drive the shared loadings. Per-slide scores are then rows of the one global
+score matrix — no separate projection step.
+
+This path is matrix-free too, so sparse input stays sparse here as well.
+
+A gene is left unscaled on every slide as soon as it is degenerate on any one
+of them. Scaling it on some slides and not others would put a per-slide scale
+difference back into exactly the low-detection genes whose detection rate is
+itself often the batch effect.
+
+Because the per-slide scales differ, the shared loading lives in
+within-slide-standardized gene coordinates: there is no single raw-unit
+back-projection. `pca_global[ct]` records `preprocessing`, `slide_centers`, and
+`slide_scales` so the affine map is recoverable.
+
+Pass `center_per_slide=False` for the older pooled behaviour — fit on all cells
+of the type at once, then project each slide. That mode stores `col_means` and
+`col_stds` instead.
+
+```python
+obj = cp.compute_pca(obj, n_pca=30)                        # within-slide (default)
+obj = cp.compute_pca(obj, n_pca=30, center_per_slide=False)  # pooled
+```
+
 ```python
 import copro as cp
 
